@@ -1,0 +1,29 @@
+{
+  "name": "com.atelyx.llama.cpp-panel",
+  "version": "0.1.0",
+  "main": "src/index.tsx",
+  "description": "把本机 llama-server 嵌进 Atelyx：托管启动与停止 llama.cpp 服务，扫描模型目录列出 .gguf 供选择启动，实时看运行状态、连接状态与日志。零第三方依赖。",
+  "author": "Atelyx",
+  "license": "MIT",
+  "keywords": ["AI", "llama.cpp", "llama-server", "效率"],
+  "atelyx": {
+    "name": "llama.cpp",
+    "type": "panel",
+    "types": ["panel", "setting", "command"],
+    "scope": "app",
+    "bundle": true,
+    "tagline": "托管启动 llama-server：扫描 gguf 模型、选模型、启停、看日志",
+    "atelyxVersionMin": "0.5.0",
+    "keepMountedOnVaultSwitch": true,
+    "platforms": ["windows-x64", "linux-x64"],
+    "declares": ["shell", "state", "fs", "app", "notification", "dialog"],
+    "permissions": {
+      "shell": "托管模式按你的配置启动 llama-server 进程，停止时结束整棵进程树（含包装层 cmd.exe/sh）",
+      "state": "保存本插件设置（可执行文件路径、模型目录、端口、附加参数、进程模式）",
+      "fs": "读取你指定的模型目录并列出其中的 *.gguf",
+      "app": "读取宿主平台，决定启动命令写法（Windows cmd.exe / Unix sh）",
+      "notification": "启动失败、连接探测失败等提示",
+      "dialog": "选择 llama-server 可执行文件与模型目录"
+    }
+  }
+}
