@@ -42,6 +42,21 @@ export interface ListDirResult {
   capped: boolean;
 }
 
+/**
+ * 默认布局规格节点：只描述结构与视图 kind，面板/标签 id 由宿主实例化时生成。
+ * `split` = 分割方向 + 子树 + 各子树占比（和 > 0）；`panel` = 一个停靠位的视图 kind 列表（首个为激活标签）。
+ */
+export type PluginLayoutSpecNode =
+  | { kind: "split"; direction: "horizontal" | "vertical"; children: PluginLayoutSpecNode[]; sizes: number[] }
+  | { kind: "panel"; views: string[] };
+
+/** 默认布局声明载荷（`ctx.layout.declareDefaultLayout`）；宿主追加为布局列表新条目。 */
+export interface PluginDefaultLayoutSpec {
+  /** 布局名（非空，≤ 64 字节；与既有布局重名时宿主追加序号）。 */
+  name: string;
+  tree: PluginLayoutSpecNode;
+}
+
 export interface AtelyxCtx extends Context {
   /** 宿主平台信息（平台决定启动命令写法）。 */
   app: {
@@ -61,7 +76,7 @@ export interface AtelyxCtx extends Context {
     renameFile(path: string, newName: string): Promise<{ ok: boolean; summary: string; actualPath: string }>;
     /** 删除单个文件。 */
     deleteFile(path: string): Promise<{ ok: boolean; summary: string }>;
-    /** 本插件私有目录绝对路径（不存在则创建；随卸载清除、更新保留）。 */
+    /** 本插件私有目录绝对路径（不存在则创建；卸载保留配置时随插件数据保留、彻底卸载清除；更新保留）。 */
     privateDir(): Promise<string>;
   };
   shell: {
@@ -75,6 +90,10 @@ export interface AtelyxCtx extends Context {
   };
   dialog: {
     pickDirectory(): Promise<string | null>;
+  };
+  /** 工作区布局：声明本插件默认布局（每插件一次性；归属 id 由宿主按调用方插件绑定）。 */
+  layout: {
+    declareDefaultLayout(spec: PluginDefaultLayoutSpec): () => void;
   };
   notification: {
     notify(input: {

@@ -166,6 +166,29 @@ export default function apply(pluginCtx: AtelyxCtx): void {
     };
   });
 
+  // 默认布局：左列上下叠放「已装模型 / 日志」，右列「模型库」。宿主一次性追加为布局列表新条目
+  // （不激活、不改用户既有布局），用户已摆放任一本插件视图时跳过——判重由宿主承担，这里无需兜底。
+  pluginCtx.layout.declareDefaultLayout({
+    name: "llama.cpp",
+    tree: {
+      kind: "split",
+      direction: "horizontal",
+      sizes: [65, 35],
+      children: [
+        {
+          kind: "split",
+          direction: "vertical",
+          sizes: [65, 35],
+          children: [
+            { kind: "panel", views: [VIEW_INSTALLED] },
+            { kind: "panel", views: [VIEW_LOGS] },
+          ],
+        },
+        { kind: "panel", views: [VIEW_LIBRARY] },
+      ],
+    },
+  });
+
   pluginCtx.effect(() => {
     const offStart = pluginCtx.slots.registerCommand({
       id: `${PLUGIN_ID}.start`,
