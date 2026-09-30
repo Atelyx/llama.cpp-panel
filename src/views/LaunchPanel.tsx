@@ -47,7 +47,6 @@ import {
   hover,
   textMuted,
   textPrimary,
-  FONT_MD,
   FONT_SM,
 } from "./ui";
 
@@ -128,11 +127,36 @@ function optionalInt(v: string, min: number): number | null {
   return Number.isInteger(n) && n >= min ? n : null;
 }
 
+/** 模型栏与参数栏并排所需的最小宽度；低于它改为上下堆叠。 */
+const TWO_COLUMN_MIN_WIDTH = 640;
+
+/**
+ * 按面板自身宽度决定上下两栏是并排还是堆叠：并排需要横向空间，窄到放不下时
+ * 参数表单里的两列输入会被压成读不成的窄条，还不如上下堆叠。观察的是面板宽度
+ * 而不是视口宽度——同一台机器上面板可停靠在不同宽度的布局里（窄面板与手机端）。
+ * 首帧用 layout effect 量一次，避免窄面板先闪一帧并排。
+ */
+function useStackedLayout(): { ref: { current: HTMLDivElement | null }; isStacked: boolean } {
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  const [isStacked, setIsStacked] = React.useState(false);
+  React.useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = (): void => setIsStacked(el.clientWidth < TWO_COLUMN_MIN_WIDTH);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  return { ref, isStacked };
+}
+
 export function LaunchPanel(props: LaunchPanelProps): unknown {
   const { ctx, runtime, host, settings, onSettingsChanged } = props;
 
   const runtimeSnapshot = React.useSyncExternalStore(runtime.subscribe, runtime.getSnapshot);
   const hostSnapshot: HostSnapshot = React.useSyncExternalStore(host.subscribe, host.getSnapshot);
+  const { ref: layoutRef, isStacked } = useStackedLayout();
 
   const online = runtimeSnapshot.channel === "direct";
   const isExternal = settings.processMode === "external";
@@ -298,272 +322,291 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
       </Toolbar>
 
       <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-        {/* 模型区 */}
-        <div style={{ flex: 3, minHeight: 0, display: "flex", flexDirection: "column" }}>
-          <SectionTitle
-            right={
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-                {folders.length > 0 ? <Chip>{`${folders.length} 个模型`}</Chip> : null}
-                {settings.mmprojFile ? <Chip title={settings.mmprojFile}>mmproj 已挂</Chip> : null}
-                {settings.modelsDir ? (
-                  <Chip title={settings.modelsDir}>{fileNameFromPath(settings.modelsDir)}</Chip>
-                ) : null}
-              </span>
-            }
-          >
-            模型
-          </SectionTitle>
-          {modelsError && !modelsLoading && (
-            <Notice tone="error" onClose={() => setModelsError("")}>
-              {modelsError}
-            </Notice>
-          )}
-          {settings.modelsDir && (
-            <div style={{ display: "flex", gap: 6, padding: "4px 10px" }}>
-              <div style={{ flex: 1, minWidth: 0, position: "relative" }}>
-                <div style={{ position: "absolute", left: 6, top: 6, color: textMuted, pointerEvents: "none" }}>
-                  <SearchIcon size={12} />
-                </div>
-                <TextInput
-                  value={modelFilter}
-                  onChange={setModelFilter}
-                  placeholder={`过滤 ${filtered.length}/${folders.length} 个模型文件夹`}
-                  style={{ paddingLeft: 32 }}
-                />
-              </div>
-              {selectedFolder ? (
-                <Button onClick={clearSelection} title="清除当前模型选择">
-                  清除
-                </Button>
-              ) : null}
-            </div>
-          )}
-
+        {/* 上半区：左侧选模型、右侧调启动参数，两栏各自滚动；窄面板改为上下堆叠 */}
+        <div ref={layoutRef} style={{ flex: 3, minHeight: 0, display: "flex", flexDirection: isStacked ? "column" : "row" }}>
+          {/* 模型选择：堆叠时 2 份高度（基数为 0，两栏按 2:3 分上半区） */}
           <div
-            style={{ flex: 1, minHeight: 0, overflowY: "auto", scrollbarGutter: "stable", display: "flex", flexDirection: "column", gap: 4, padding: "4px 10px 8px" }}
-            className={SCROLL_LIST_CLASS}
+            style={{
+              flex: isStacked ? "2 1 0" : "0 1 300px",
+              minWidth: isStacked ? 0 : 220,
+              minHeight: 0,
+              display: "flex",
+              flexDirection: "column",
+              borderRight: isStacked ? undefined : `1px solid ${border}`,
+              borderBottom: isStacked ? `1px solid ${border}` : undefined,
+            }}
           >
-            {modelsLoading ? (
-              <div style={{ padding: 12, color: textMuted }}>扫描中…</div>
-            ) : !settings.modelsDir ? (
-              <Empty>
-                未设置模型目录。
-                <div style={{ fontSize: 11 }}>到本插件的设置页选择模型目录；扫描会递归找出里面的 .gguf 模型文件夹。</div>
-              </Empty>
-            ) : folders.length === 0 ? (
-              modelsError ? null : (
-                <Empty>
-                  未发现含 .gguf 的模型文件夹。
-                  <div style={{ fontSize: 11 }}>一个模型一个文件夹（内含各量化与 mmproj）；确认目录存在且里面确有 gguf 模型。</div>
-                </Empty>
-              )
-            ) : filtered.length === 0 ? (
-              <Empty>无匹配模型（过滤器 {modelFilter}）</Empty>
-            ) : (
-              filtered.map((f) => {
-                const selected = f === selectedFolder;
-                const dir = dirNameOf(f.rel);
-                const base = dir ? f.rel.slice(dir.length + 1) : f.rel;
-                // 量化体积合计（宿主缺 size 的条目按 0 计，全缺则不显示大小）
-                const totalBytes = f.quants.reduce((sum, q) => sum + (q.size ?? 0), 0);
-                const hasSize = f.quants.some((q) => q.size != null);
-                return (
-                  <div
-                    key={f.rel}
-                    onClick={() => selectFolder(f)}
-                    title={f.full}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 8,
-                      padding: "6px 8px",
-                      borderRadius: 6,
-                      cursor: "pointer",
-                      border: `1px solid ${selected ? accent : border}`,
-                      background: selected ? hover : "transparent",
-                      color: textPrimary,
-                      fontSize: FONT_SM,
-                      lineHeight: 1.6,
-                    }}
-                  >
-                    <span style={{ flexShrink: 0, color: selected ? accent : textMuted }}>
-                      <ImageIcon size={14} />
-                    </span>
-                    <span
-                      style={{
-                        flex: 1,
-                        minWidth: 0,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                        fontWeight: selected ? 600 : 400,
-                      }}
-                    >
-                      {dir ? <span style={{ color: textMuted }}>{`${dir}/`}</span> : null}
-                      {base}
-                    </span>
-                    <span style={{ flexShrink: 0, color: textMuted, fontSize: 11 }}>
-                      {`${f.quants.length} 个量化${f.mms.length > 0 ? ` · ${f.mms.length} 投影` : ""}${hasSize ? ` · ${formatSize(totalBytes)}` : ""}`}
-                    </span>
-                  </div>
-                );
-              })
+            <SectionTitle
+              right={
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                  {folders.length > 0 ? <Chip>{`${folders.length} 个模型`}</Chip> : null}
+                  {settings.mmprojFile ? <Chip title={settings.mmprojFile}>mmproj 已挂</Chip> : null}
+                  {settings.modelsDir ? (
+                    <Chip title={settings.modelsDir}>{fileNameFromPath(settings.modelsDir)}</Chip>
+                  ) : null}
+                </span>
+              }
+            >
+              模型
+            </SectionTitle>
+            {modelsError && !modelsLoading && (
+              <Notice tone="error" onClose={() => setModelsError("")}>
+                {modelsError}
+              </Notice>
             )}
-          </div>
+            {settings.modelsDir && (
+              <div style={{ display: "flex", gap: 6, padding: "4px 10px" }}>
+                <div style={{ flex: 1, minWidth: 0, position: "relative" }}>
+                  <div style={{ position: "absolute", left: 6, top: 6, color: textMuted, pointerEvents: "none" }}>
+                    <SearchIcon size={12} />
+                  </div>
+                  <TextInput
+                    value={modelFilter}
+                    onChange={setModelFilter}
+                    placeholder={`过滤 ${filtered.length}/${folders.length} 个模型文件夹`}
+                    style={{ paddingLeft: 32 }}
+                  />
+                </div>
+                {selectedFolder ? (
+                  <Button onClick={clearSelection} title="清除当前模型选择">
+                    清除
+                  </Button>
+                ) : null}
+              </div>
+            )}
 
-          {/* 启动参数区：常驻入口——未选中模型时给引导，选中后是完整表单；改动按文件夹持久化并同步启动字段 */}
-          {selectedFolder && params ? (
             <div
-              style={{ flexShrink: 0, maxHeight: "45%", overflowY: "auto", borderTop: `1px solid ${border}`, padding: "8px 10px 4px", display: "flex", flexDirection: "column", gap: 4 }}
+              style={{ flex: 1, minHeight: 0, overflowY: "auto", scrollbarGutter: "stable", display: "flex", flexDirection: "column", gap: 4, padding: "4px 10px 8px" }}
               className={SCROLL_LIST_CLASS}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                <span style={{ fontSize: FONT_MD, fontWeight: 600, color: textPrimary }}>启动参数</span>
-                <span style={{ fontSize: 11, color: textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={selectedFolder.full}>
-                  {fileNameFromPath(selectedFolder.rel)}
+              {modelsLoading ? (
+                <div style={{ padding: 12, color: textMuted }}>扫描中…</div>
+              ) : !settings.modelsDir ? (
+                <Empty>
+                  未设置模型目录。
+                  <div style={{ fontSize: 11 }}>到本插件的设置页选择模型目录；扫描会递归找出里面的 .gguf 模型文件夹。</div>
+                </Empty>
+              ) : folders.length === 0 ? (
+                modelsError ? null : (
+                  <Empty>
+                    未发现含 .gguf 的模型文件夹。
+                    <div style={{ fontSize: 11 }}>一个模型一个文件夹（内含各量化与 mmproj）；确认目录存在且里面确有 gguf 模型。</div>
+                  </Empty>
+                )
+              ) : filtered.length === 0 ? (
+                <Empty>无匹配模型（过滤器 {modelFilter}）</Empty>
+              ) : (
+                filtered.map((f) => {
+                  const selected = f === selectedFolder;
+                  const dir = dirNameOf(f.rel);
+                  const base = dir ? f.rel.slice(dir.length + 1) : f.rel;
+                  // 量化体积合计（宿主缺 size 的条目按 0 计，全缺则不显示大小）
+                  const totalBytes = f.quants.reduce((sum, q) => sum + (q.size ?? 0), 0);
+                  const hasSize = f.quants.some((q) => q.size != null);
+                  return (
+                    <div
+                      key={f.rel}
+                      onClick={() => selectFolder(f)}
+                      title={f.full}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "6px 8px",
+                        borderRadius: 6,
+                        cursor: "pointer",
+                        border: `1px solid ${selected ? accent : border}`,
+                        background: selected ? hover : "transparent",
+                        color: textPrimary,
+                        fontSize: FONT_SM,
+                        lineHeight: 1.6,
+                      }}
+                    >
+                      <span style={{ flexShrink: 0, color: selected ? accent : textMuted }}>
+                        <ImageIcon size={14} />
+                      </span>
+                      <span
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                          fontWeight: selected ? 600 : 400,
+                        }}
+                      >
+                        {dir ? <span style={{ color: textMuted }}>{`${dir}/`}</span> : null}
+                        {base}
+                      </span>
+                      <span style={{ flexShrink: 0, color: textMuted, fontSize: 11 }}>
+                        {`${f.quants.length} 个量化${f.mms.length > 0 ? ` · ${f.mms.length} 投影` : ""}${hasSize ? ` · ${formatSize(totalBytes)}` : ""}`}
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
+          {/* 启动参数设置：按模型文件夹持久化，未选中模型时给引导；堆叠时 3 份高度 */}
+          <div style={{ flex: isStacked ? "3 1 0" : 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
+            <SectionTitle
+              right={
+                <span style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0, justifyContent: "flex-end" }}>
+                  {selectedFolder ? (
+                    <span
+                      title={selectedFolder.full}
+                      style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textTransform: "none", letterSpacing: 0 }}
+                    >
+                      {fileNameFromPath(selectedFolder.rel)}
+                    </span>
+                  ) : null}
+                  <span style={{ flexShrink: 0 }}>按模型保存</span>
                 </span>
-                <span style={{ fontSize: 11, color: textMuted, marginLeft: "auto", flexShrink: 0 }}>按模型保存</span>
-              </div>
-              <Field label="量化文件">
-                <Select
-                  value={params.quant || (selectedFolder.quants[0] ? folderRelName(selectedFolder, selectedFolder.quants[0]) : "")}
-                  onChange={(v) => updateParams({ quant: v })}
-                  options={selectedFolder.quants.map((q) => ({
-                    value: folderRelName(selectedFolder, q),
-                    label: `${fileNameFromPath(q.name)}${q.size != null ? `（${formatSize(q.size)}）` : ""}`,
-                  }))}
-                />
-              </Field>
-              <Field label="视觉投影（多模态模型）">
-                <Select
-                  value={params.mmproj}
-                  onChange={(v) => updateParams({ mmproj: v })}
-                  options={[
-                    { value: "", label: "不挂投影" },
-                    ...selectedFolder.mms.map((m) => ({
-                      value: folderRelName(selectedFolder, m),
-                      label: fileNameFromPath(m.name),
-                    })),
-                  ]}
-                />
-              </Field>
-              <div style={{ display: "flex", gap: 8 }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <Field label="GPU 层数（-ngl）">
-                    <TextInput
-                      value={params.ngl === null ? "" : String(params.ngl)}
-                      onChange={(v) => updateParams({ ngl: optionalInt(v, 0) })}
-                      type="number"
-                      min={0}
-                      placeholder="不传"
-                    />
-                  </Field>
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <Field label="上下文（--ctx-size）">
-                    <TextInput
-                      value={params.ctxSize === null ? "" : String(params.ctxSize)}
-                      onChange={(v) => updateParams({ ctxSize: optionalInt(v, 1) })}
-                      type="number"
-                      min={1}
-                      placeholder="默认"
-                    />
-                  </Field>
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <Field label="线程数（--threads）">
-                    <TextInput
-                      value={params.threads === null ? "" : String(params.threads)}
-                      onChange={(v) => updateParams({ threads: optionalInt(v, 1) })}
-                      type="number"
-                      min={1}
-                      placeholder="自动"
-                    />
-                  </Field>
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <Field label="并行槽位（--parallel）">
-                    <TextInput
-                      value={params.parallel === null ? "" : String(params.parallel)}
-                      onChange={(v) => updateParams({ parallel: optionalInt(v, 1) })}
-                      type="number"
-                      min={1}
-                      placeholder="1"
-                    />
-                  </Field>
-                </div>
-              </div>
-              <Field label="KV 缓存 K 量化" hint="量化 KV 缓存省显存。">
-                <Select
-                  value={params.cacheTypeK}
-                  onChange={(v) => updateParams({ cacheTypeK: v })}
-                  options={[
-                    { value: "", label: "默认（f16）" },
-                    { value: "q8_0", label: "q8_0（显存减半，近无损）" },
-                    { value: "q4_0", label: "q4_0（更省，质量略降）" },
-                    { value: "q5_1", label: "q5_1" },
-                    { value: "bf16", label: "bf16" },
-                  ]}
-                />
-              </Field>
-              <Field label="载入模式">
-                <Select
-                  value={params.loadMode}
-                  onChange={(v) => updateParams({ loadMode: v })}
-                  options={[
-                    { value: "", label: "默认（auto）" },
-                    { value: "auto", label: "auto（自动选择）" },
-                    { value: "mmap", label: "mmap（内存映射）" },
-                    { value: "mmap+mlock", label: "mmap+mlock（映射并锁定）" },
-                    { value: "mlock", label: "mlock（锁定内存）" },
-                    { value: "none", label: "none（直接读入）" },
-                    { value: "dio", label: "dio（直接 I/O）" },
-                  ]}
-                />
-              </Field>
-              <Field label="常用开关">
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 16px" }}>
-                  <Checkbox
-                    checked={params.flashAttn}
-                    onChange={(c) => updateParams({ flashAttn: c })}
-                    label="Flash Attention"
-                    title="--flash-attn on：注意力提速并省显存"
+              }
+            >
+              启动参数
+            </SectionTitle>
+            {selectedFolder && params ? (
+              <div
+                style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px 10px 4px", display: "flex", flexDirection: "column", gap: 4 }}
+                className={SCROLL_LIST_CLASS}
+              >
+                <Field label="量化文件">
+                  <Select
+                    value={params.quant || (selectedFolder.quants[0] ? folderRelName(selectedFolder, selectedFolder.quants[0]) : "")}
+                    onChange={(v) => updateParams({ quant: v })}
+                    options={selectedFolder.quants.map((q) => ({
+                      value: folderRelName(selectedFolder, q),
+                      label: `${fileNameFromPath(q.name)}${q.size != null ? `（${formatSize(q.size)}）` : ""}`,
+                    }))}
                   />
-                  <Checkbox
-                    checked={params.jinja}
-                    onChange={(c) => updateParams({ jinja: c })}
-                    label="Jinja 模板"
-                    title="--jinja：使用模型自带的聊天模板"
+                </Field>
+                <Field label="视觉投影（多模态模型）">
+                  <Select
+                    value={params.mmproj}
+                    onChange={(v) => updateParams({ mmproj: v })}
+                    options={[
+                      { value: "", label: "不挂投影" },
+                      ...selectedFolder.mms.map((m) => ({
+                        value: folderRelName(selectedFolder, m),
+                        label: fileNameFromPath(m.name),
+                      })),
+                    ]}
                   />
-                  <Checkbox
-                    checked={params.noWebui}
-                    onChange={(c) => updateParams({ noWebui: c })}
-                    label="隐藏 WebUI"
-                    title="--no-webui：不开放内置网页界面"
-                  />
+                </Field>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <Field label="GPU 层数（-ngl）">
+                      <TextInput
+                        value={params.ngl === null ? "" : String(params.ngl)}
+                        onChange={(v) => updateParams({ ngl: optionalInt(v, 0) })}
+                        type="number"
+                        min={0}
+                        placeholder="不传"
+                      />
+                    </Field>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <Field label="上下文（--ctx-size）">
+                      <TextInput
+                        value={params.ctxSize === null ? "" : String(params.ctxSize)}
+                        onChange={(v) => updateParams({ ctxSize: optionalInt(v, 1) })}
+                        type="number"
+                        min={1}
+                        placeholder="默认"
+                      />
+                    </Field>
+                  </div>
                 </div>
-              </Field>
-              <Field label="附加参数" hint="空白分隔，含空格的项用引号包裹。">
-                <TextInput
-                  value={params.extraArgs}
-                  onChange={(v) => updateParams({ extraArgs: v })}
-                  placeholder="--no-mmap --flash-attn 等"
-                />
-              </Field>
-            </div>
-          ) : (
-            <div style={{ flexShrink: 0, borderTop: `1px solid ${border}`, padding: "8px 10px", background: bgSecondary }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: FONT_MD, fontWeight: 600, color: textPrimary }}>启动参数</span>
-                <span style={{ fontSize: 11, color: textMuted, marginLeft: "auto", flexShrink: 0 }}>按模型保存</span>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <Field label="线程数（--threads）">
+                      <TextInput
+                        value={params.threads === null ? "" : String(params.threads)}
+                        onChange={(v) => updateParams({ threads: optionalInt(v, 1) })}
+                        type="number"
+                        min={1}
+                        placeholder="自动"
+                      />
+                    </Field>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <Field label="并行槽位（--parallel）">
+                      <TextInput
+                        value={params.parallel === null ? "" : String(params.parallel)}
+                        onChange={(v) => updateParams({ parallel: optionalInt(v, 1) })}
+                        type="number"
+                        min={1}
+                        placeholder="1"
+                      />
+                    </Field>
+                  </div>
+                </div>
+                <Field label="KV 缓存 K 量化" hint="量化 KV 缓存省显存。">
+                  <Select
+                    value={params.cacheTypeK}
+                    onChange={(v) => updateParams({ cacheTypeK: v })}
+                    options={[
+                      { value: "", label: "默认（f16）" },
+                      { value: "q8_0", label: "q8_0（显存减半，近无损）" },
+                      { value: "q4_0", label: "q4_0（更省，质量略降）" },
+                      { value: "q5_1", label: "q5_1" },
+                      { value: "bf16", label: "bf16" },
+                    ]}
+                  />
+                </Field>
+                <Field label="载入模式">
+                  <Select
+                    value={params.loadMode}
+                    onChange={(v) => updateParams({ loadMode: v })}
+                    options={[
+                      { value: "", label: "默认（auto）" },
+                      { value: "auto", label: "auto（自动选择）" },
+                      { value: "mmap", label: "mmap（内存映射）" },
+                      { value: "mmap+mlock", label: "mmap+mlock（映射并锁定）" },
+                      { value: "mlock", label: "mlock（锁定内存）" },
+                      { value: "none", label: "none（直接读入）" },
+                      { value: "dio", label: "dio（直接 I/O）" },
+                    ]}
+                  />
+                </Field>
+                <Field label="常用开关">
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 16px" }}>
+                    <Checkbox
+                      checked={params.flashAttn}
+                      onChange={(c) => updateParams({ flashAttn: c })}
+                      label="Flash Attention"
+                      title="--flash-attn on：注意力提速并省显存"
+                    />
+                    <Checkbox
+                      checked={params.jinja}
+                      onChange={(c) => updateParams({ jinja: c })}
+                      label="Jinja 模板"
+                      title="--jinja：使用模型自带的聊天模板"
+                    />
+                    <Checkbox
+                      checked={params.noWebui}
+                      onChange={(c) => updateParams({ noWebui: c })}
+                      label="隐藏 WebUI"
+                      title="--no-webui：不开放内置网页界面"
+                    />
+                  </div>
+                </Field>
+                <Field label="附加参数">
+                  <TextInput
+                    value={params.extraArgs}
+                    onChange={(v) => updateParams({ extraArgs: v })}
+                    placeholder="空白分隔，含空格的项用引号包裹"
+                  />
+                </Field>
               </div>
-              <div style={{ marginTop: 4, fontSize: FONT_SM, color: textMuted, lineHeight: 1.6 }}>
-                在上方点选一个模型文件夹，即可在此设置它的量化文件、视觉投影、GPU 层数（-ngl）、上下文（--ctx-size）与附加参数。
+            ) : (
+              <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px 10px", color: textMuted, lineHeight: 1.6 }} className={SCROLL_LIST_CLASS}>
+                在左侧点选一个模型文件夹，即可在此设置它的量化文件、视觉投影、GPU 层数（-ngl）、上下文（--ctx-size）与附加参数。
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         {/* 日志区 */}
