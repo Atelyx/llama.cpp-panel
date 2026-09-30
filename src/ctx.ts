@@ -61,8 +61,6 @@ export interface AtelyxCtx extends Context {
   };
   dialog: {
     pickDirectory(): Promise<string | null>;
-    /** 选择文件；filters 为可选类型提示。 */
-    pickFile(filters?: { name: string; extensions: string[] }[]): Promise<string | null>;
   };
   notification: {
     notify(input: {

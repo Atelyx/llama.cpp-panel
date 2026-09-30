@@ -69,25 +69,18 @@ export function SettingsView(props: SettingsProps): unknown {
     setDialogError(err instanceof Error ? err.message : String(err));
   }
 
-  const pickDirectory = React.useCallback(async (): Promise<void> => {
-    setDialogError("");
-    try {
-      const dir = await ctx.dialog.pickDirectory();
-      if (dir) patch({ modelsDir: dir });
-    } catch (err) {
-      notifyErr(err);
-    }
-  }, [ctx, patch]);
-
-  const pickFile = React.useCallback(async (): Promise<void> => {
-    setDialogError("");
-    try {
-      const file = await ctx.dialog.pickFile();
-      if (file) patch({ serverPath: file });
-    } catch (err) {
-      notifyErr(err);
-    }
-  }, [ctx, patch]);
+  const pickFolder = React.useCallback(
+    async (field: "modelsDir" | "serverDir"): Promise<void> => {
+      setDialogError("");
+      try {
+        const dir = await ctx.dialog.pickDirectory();
+        if (dir) patch(field === "modelsDir" ? { modelsDir: dir } : { serverDir: dir });
+      } catch (err) {
+        notifyErr(err);
+      }
+    },
+    [ctx, patch],
+  );
 
   const setPort = React.useCallback(
     (v: string): void => {
@@ -142,10 +135,10 @@ export function SettingsView(props: SettingsProps): unknown {
         </Card>
 
         <Card title={isExternal ? "外部进程（只检测，不托管）" : "进程托管"}>
-          <Field label="llama-server 可执行文件" hint="托管启动时用它拉起服务。">
+          <Field label="llama-server 文件夹" hint="文件夹里放 llama-server（Windows 为 llama-server.exe），启动时按平台名在里面查找。">
             <div style={{ display: "flex", gap: 6 }}>
-              <TextInput value={settings.serverPath} onChange={(v) => patch({ serverPath: v })} placeholder="C:\tools\llama\llama-server.exe" style={{ flex: 1 }} />
-              <Button onClick={pickFile} title="选择 llama-server 可执行文件">选择</Button>
+              <TextInput value={settings.serverDir} onChange={(v) => patch({ serverDir: v })} placeholder="选择或输入 llama-server 所在文件夹" style={{ flex: 1 }} />
+              <Button onClick={() => pickFolder("serverDir")} title="选择 llama-server 所在文件夹">选择</Button>
             </div>
           </Field>
           <Field label="进程模式" hint="托管：插件负责启停；外部：只检测连接。">
@@ -164,7 +157,7 @@ export function SettingsView(props: SettingsProps): unknown {
           <Field label="模型目录" hint="递归扫描 *.gguf 的根目录。选模型与启动参数在面板的模型区。">
             <div style={{ display: "flex", gap: 6 }}>
               <TextInput value={settings.modelsDir} onChange={(v) => patch({ modelsDir: v })} placeholder="选择或输入模型文件夹" style={{ flex: 1 }} />
-              <Button onClick={pickDirectory} title="选择模型目录">选择</Button>
+              <Button onClick={() => pickFolder("modelsDir")} title="选择模型目录">选择</Button>
             </div>
           </Field>
         </Card>

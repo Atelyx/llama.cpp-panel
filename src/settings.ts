@@ -14,8 +14,8 @@ export interface LlamaSettings {
   host: string;
   /** 监听端口：既是连接探测目标，也是托管启动时传给 llama-server 的端口。 */
   port: number;
-  /** llama-server 可执行文件路径。 */
-  serverPath: string;
+  /** llama-server 所在文件夹：可执行文件在里面，启动时按平台名查找。 */
+  serverDir: string;
   /** 模型目录：扫描 *.gguf 的根目录（用户自选的本地路径）。 */
   modelsDir: string;
   /** 启动用的模型文件（全路径），由面板选中模型的量化选择写入。 */
@@ -67,7 +67,7 @@ const STATE_VERSION = 1;
 export const DEFAULT_SETTINGS: LlamaSettings = {
   host: "127.0.0.1",
   port: 8080,
-  serverPath: "",
+  serverDir: "",
   modelsDir: "",
   modelFile: "",
   mmprojFile: "",
@@ -121,7 +121,7 @@ function coerce(raw: unknown): LlamaSettings {
       typeof port === "number" && Number.isInteger(port) && port > 0 && port < 65536
         ? port
         : DEFAULT_SETTINGS.port,
-    serverPath: str("serverPath", DEFAULT_SETTINGS.serverPath).trim(),
+    serverDir: str("serverDir", DEFAULT_SETTINGS.serverDir).trim(),
     modelsDir: str("modelsDir", DEFAULT_SETTINGS.modelsDir).trim(),
     modelFile: str("modelFile", DEFAULT_SETTINGS.modelFile).trim(),
     mmprojFile: str("mmprojFile", DEFAULT_SETTINGS.mmprojFile).trim(),

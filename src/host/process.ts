@@ -6,9 +6,13 @@
  *    /C、-c 转达，不能直接指定 llama-server 本身。
  * 2. 包装层是 cmd.exe/sh —— 只结束包装进程会把真正的服务留成孤儿，因此经 spawn
  *    拿到的句柄 cancel() 结束整棵进程树，而不是按命令行特征找进程。
+ *
+ * 用户选的是 llama-server 所在文件夹而不是可执行文件本身：同一份发布里可执行文件名
+ * 随平台变（Windows 带 .exe），让代码按平台名去文件夹里找，用户换平台不必重选。
  */
-import type { AtelyxCtx, ShellStreamHandlers, ShellProcessHandle } from "../ctx";
+import type { AtelyxCtx, ListDirResult, ShellStreamHandlers, ShellProcessHandle } from "../ctx";
 import { paramsFor, type LlamaSettings } from "../settings";
+import { describeFsError } from "./models";
 
 export type Platform = "windows" | "unix";
 
@@ -51,15 +55,57 @@ export function splitArgs(text: string): string[] {
   return out;
 }
 
+/** 平台对应的 llama-server 可执行文件名。 */
+export function executableName(platform: Platform): string {
+  return platform === "windows" ? "llama-server.exe" : "llama-server";
+}
+
+/**
+ * 在所选文件夹里找 llama-server：先按平台标准名精确匹配（大小写不敏感），再退到
+ * 同前缀的改名构建（如 llama-server-cuda.exe）；找不到返回 null，由调用方给提示。
+ */
+export async function findServerExecutable(
+  ctx: AtelyxCtx,
+  platform: Platform,
+  serverDir: string,
+): Promise<string | null> {
+  const folder = serverDir.trim().replace(/\\+/g, "/").replace(/\/+$/, "");
+  if (!folder) return null;
+  let listing: ListDirResult;
+  try {
+    listing = await ctx.fs.listDir(folder);
+  } catch (err: unknown) {
+    throw new Error(describeFsError(err, "llama-server 文件夹"));
+  }
+  const files = listing.entries.filter((entry) => entry.kind === "file");
+  const want = executableName(platform);
+  const exact = files.find((entry) => entry.name.toLowerCase() === want.toLowerCase());
+  if (exact) return `${folder}/${exact.name}`;
+  const renamed = files
+    .map((entry) => entry.name)
+    .filter((name) => {
+      const stem = name.replace(/\.exe$/i, "").toLowerCase();
+      // Windows 只认 .exe：同目录还可能有 dll，前缀相同也不该被当成程序
+      return stem.startsWith("llama-server") && (platform === "unix" || /\.exe$/i.test(name));
+    })
+    .sort((a, b) => a.localeCompare(b));
+  return renamed.length > 0 ? `${folder}/${renamed[0]}` : null;
+}
+
+/** 找不到可执行文件时的可操作提示。 */
+export function missingExecutableMessage(serverDir: string, platform: Platform): string {
+  const folder = serverDir.trim();
+  if (!folder) return "未配置 llama-server 文件夹";
+  return `在 ${folder} 里没找到 ${executableName(platform)}`;
+}
+
 /** llama-server 参数（不含包装层）。`--model` 是模型标志（llama.cpp server 惯用写法）。 */
-export function buildStartTokens(settings: LlamaSettings): string[] {
-  const server = settings.serverPath.trim();
+export function buildStartTokens(settings: LlamaSettings, serverExe: string): string[] {
   const model = settings.modelFile.trim();
-  if (!server) throw new Error("未配置 llama-server 可执行文件路径");
   if (!model) throw new Error("未选择模型文件");
   // --host 必须显式传：llama-server 默认只绑 127.0.0.1，局域网设备调不了 API
   const tokens = [
-    server,
+    serverExe,
     "--host",
     settings.host.trim() || "127.0.0.1",
     "--model",
@@ -99,8 +145,8 @@ function shellQuote(value: string): string {
 }
 
 /** 供界面展示的命令行（仅为可读，执行不走它）。 */
-export function describeStartCommand(settings: LlamaSettings): string {
-  return buildStartTokens(settings).map(shellQuote).join(" ");
+export function describeStartCommand(settings: LlamaSettings, serverExe: string): string {
+  return buildStartTokens(settings, serverExe).map(shellQuote).join(" ");
 }
 
 /** 按平台组装执行参数。 */
@@ -128,10 +174,11 @@ export async function startLlama(
   ctx: AtelyxCtx,
   platform: Platform,
   settings: LlamaSettings,
+  serverExe: string,
   handlers: StartHandlers,
 ): Promise<ShellProcessHandle> {
   const command = platform === "windows" ? "cmd.exe" : "sh";
-  const args = runArgs(platform, buildStartTokens(settings));
+  const args = runArgs(platform, buildStartTokens(settings, serverExe));
   const cwd = dirname(settings.modelFile.trim());
   // 宿主只给原始流（chunk/end/error），我的上层回调（onLog/onExit/onError）在此映射
   const raw: ShellStreamHandlers = {

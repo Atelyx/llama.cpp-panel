@@ -79,7 +79,7 @@ export async function listModels(ctx: AtelyxCtx, modelsDir: string): Promise<Lis
   try {
     await walk(root, "", 0);
   } catch (err: unknown) {
-    return { ok: false, error: describeFsError(err) };
+    return { ok: false, error: describeFsError(err, "模型目录") };
   }
   const byPath = (a: ModelEntry, b: ModelEntry): number => a.name.localeCompare(b.name);
   models.sort(byPath);
@@ -102,9 +102,9 @@ export function joinModelPath(modelsDir: string, name: string): string {
 
 /**
  * 宿主 fs 经 Tauri invoke 抛的是字符串而非 Error，两种形态都要透出，
- * 否则真实原因（不存在/无权限等）会被兜底文案吞掉。
+ * 否则真实原因（不存在/无权限等）会被兜底文案吞掉。what = 被读的对象（模型目录等）。
  */
-function describeFsError(err: unknown): string {
+export function describeFsError(err: unknown, what: string): string {
   const reason = (typeof err === "string" ? err : err instanceof Error ? err.message : "").trim();
-  return reason ? `读取模型目录失败：${reason}` : "读取模型目录失败（目录不存在或不是目录）";
+  return reason ? `读取${what}失败：${reason}` : `读取${what}失败（目录不存在或不是目录）`;
 }

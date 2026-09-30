@@ -9,6 +9,8 @@ import type { LlamaSettings } from "../settings";
 import type { LlamaRuntime } from "../runtime";
 import {
   describeStartCommand,
+  findServerExecutable,
+  missingExecutableMessage,
   resolvePlatform,
   startLlama,
   type Platform,
@@ -168,8 +170,15 @@ export class HostController {
     this.notified = false;
     this.cancelled = false;
     let line: string;
+    let exe: string;
+    let platform: Platform;
     try {
-      line = describeStartCommand(this.settings);
+      platform = await this.getPlatform();
+      const found = await findServerExecutable(this.ctx, platform, this.settings.serverDir);
+      // 用户选的是文件夹，可执行文件在这一步才定位：找不到就以可操作的原因收场
+      if (!found) throw new Error(missingExecutableMessage(this.settings.serverDir, platform));
+      exe = found;
+      line = describeStartCommand(this.settings, exe);
     } catch (err) {
       const message = describe(err);
       this.emit({ error: message });
@@ -181,8 +190,9 @@ export class HostController {
     try {
       const handle = await startLlama(
         this.ctx,
-        await this.getPlatform(),
+        platform,
         this.settings,
+        exe,
         {
           onLog: (text, stream) => {
             if (stream === "stderr" && text.trim()) this.lastStderr = text.trim();
