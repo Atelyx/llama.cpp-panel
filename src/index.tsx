@@ -1,39 +1,45 @@
 /**
- * 插件入口：装配启动面板、设置页与命令。
+ * 插件入口：注册三个页签（模型库 / 已装模型 / 日志）、设置页与命令。
  *
- * 连接状态（runtime）与进程托管（host）在 `apply` 期间建立一次，界面消费其快照，
- * 因此切面板不会断连接；停用时注册项与轮询随上下文一起撤销。
- *
- * 进程收尾由 Atelyx 统一负责（插件停用/卸载/应用退出都会结束本插件启动的进程树），
- * 本插件只停轮询，不自己 cancel 进程——避免误杀用户自起的外部服务。
+ * runtime 与 host 在 apply 期间各建一次，页签只消费快照——页签拆到不同面板也共享同一份
+ * 连接状态、进程状态与下载任务。进程收尾归 Atelyx，这里只停轮询与下载，不 cancel 长期进程，
+ * 以免误杀用户自起的外部服务。
  */
 import React from "react";
 import type { AtelyxCtx } from "./ctx";
 import { loadSettings, saveSettings, type LlamaSettings } from "./settings";
 import { LlamaRuntime } from "./runtime";
 import { HostController } from "./host/controller";
-import { LaunchPanel } from "./views/LaunchPanel";
+import { Downloader } from "./host/downloader";
+import { LibraryView } from "./views/Library";
+import { InstalledView } from "./views/Installed";
+import { LogsView } from "./views/Logs";
 import { SettingsView } from "./views/Settings";
-import { bgSecondary, border, FONT_SM, textMuted } from "./views/ui";
+import { PANEL_CSS, bgSecondary, border, textMuted, FONT_SM } from "./views/ui";
 
 /** 与清单里的 name 一致。 */
 const PLUGIN_ID = "com.atelyx.llama.cpp-panel";
 
-const VIEW_KIND = PLUGIN_ID;
+/** 页签标识：`kind` 是开放槽位，注册即出现在面板的「添加视图」里。 */
+const VIEW_LIBRARY = `${PLUGIN_ID}.library`;
+const VIEW_INSTALLED = `${PLUGIN_ID}.installed`;
+const VIEW_LOGS = `${PLUGIN_ID}.logs`;
+
 const SETTING_KEY = `${PLUGIN_ID}.settings`;
 
-/** 三者就绪后才可渲染。 */
+/** 就绪后视图依赖的一组服务与状态。 */
 interface PanelDeps {
   ctx: AtelyxCtx;
   runtime: LlamaRuntime;
   host: HostController;
+  downloader: Downloader;
   settings: LlamaSettings;
   onSettingsChanged: (next: LlamaSettings) => void;
 }
 
 export default function apply(pluginCtx: AtelyxCtx): void {
-  // 设置要先读出来才能建运行时（地址与端口决定传输层）。读取是异步的，
-  // 故设一个就绪后通知订阅者的小状态：未就绪时显示初始化中，而不是闪空白。
+  // 设置要先读出来才能建 runtime（地址端口决定传输层）。读取是异步的，故设一个就绪后通知
+  // 订阅者的小状态——未就绪时显示「初始化中」而不是闪空白。
   let deps: PanelDeps | null = null;
   const listeners = new Set<() => void>();
   const subscribe = (listener: () => void): (() => void) => {
@@ -45,8 +51,8 @@ export default function apply(pluginCtx: AtelyxCtx): void {
     for (const listener of listeners) listener();
   };
 
-  // 设置变更：更新运行时/宿主的内存设置、重建 deps（新引用触发视图重渲），落盘统一在此收口——
-  // 面板的每模型参数与设置页的全局项走同一条路，任何改动都持久化，视图侧不再各自保存。
+  // 设置变更的统一收口：更新 runtime/host 的内存设置并重建 deps（换引用触发重渲），再落盘。
+  // 各页签的每模型参数、镜像站与设置页的全局项都走这条路。
   const onSettingsChanged = (next: LlamaSettings): void => {
     if (deps) {
       deps.runtime.applySettings(next);
@@ -62,7 +68,8 @@ export default function apply(pluginCtx: AtelyxCtx): void {
     .then((loaded) => {
       const runtime = new LlamaRuntime(loaded);
       const host = new HostController(pluginCtx, loaded);
-      deps = { ctx: pluginCtx, runtime, host, settings: loaded, onSettingsChanged };
+      const downloader = new Downloader(pluginCtx);
+      deps = { ctx: pluginCtx, runtime, host, downloader, settings: loaded, onSettingsChanged };
 
       // 常驻轮询保持连接状态新鲜
       runtime.startPolling();
@@ -78,7 +85,10 @@ export default function apply(pluginCtx: AtelyxCtx): void {
       });
     });
 
-  /** 面板外壳：铺满可用空间（显式 width 防宿主包装层出现收缩上下文时缩成内容宽），自带边框跟随宿主主题。 */
+  /**
+   * 面板外壳：铺满可用空间（显式 width 防宿主包装层缩成内容宽）。共用的样式表也挂在这里——
+   * 它只在该页签挂载时生效，而滚动条与悬停底色是每个页签都要的，故放在共同外壳上。
+   */
   function PanelShell(props: { children: unknown }): unknown {
     return (
       <div
@@ -92,6 +102,7 @@ export default function apply(pluginCtx: AtelyxCtx): void {
           background: bgSecondary,
         }}
       >
+        <style>{PANEL_CSS}</style>
         {props.children}
       </div>
     );
@@ -105,15 +116,24 @@ export default function apply(pluginCtx: AtelyxCtx): void {
     );
   }
 
-  function LaunchView(): unknown {
-    const ready = React.useSyncExternalStore(subscribe, getDeps);
-    if (!ready) return <InitPlaceholder />;
-    return (
-      <PanelShell>
-        <LaunchPanel ctx={ready.ctx} runtime={ready.runtime} host={ready.host} settings={ready.settings} onSettingsChanged={ready.onSettingsChanged} />
-      </PanelShell>
-    );
+  /** 就绪依赖 → 视图的装配收在一处；页签自带就绪判定，先打开哪个都能等到依赖就绪。 */
+  function panel(render: (ready: PanelDeps) => unknown): () => unknown {
+    return function Panel(): unknown {
+      const ready = React.useSyncExternalStore(subscribe, getDeps);
+      if (!ready) return <InitPlaceholder />;
+      return <PanelShell>{render(ready)}</PanelShell>;
+    };
   }
+
+  const LibraryPanel = panel((ready) => (
+    <LibraryView ctx={ready.ctx} downloader={ready.downloader} settings={ready.settings} onSettingsChanged={ready.onSettingsChanged} />
+  ));
+
+  const InstalledPanel = panel((ready) => (
+    <InstalledView ctx={ready.ctx} runtime={ready.runtime} host={ready.host} settings={ready.settings} onSettingsChanged={ready.onSettingsChanged} />
+  ));
+
+  const LogsPanel = panel((ready) => <LogsView host={ready.host} />);
 
   function SettingsPanelView(): unknown {
     const ready = React.useSyncExternalStore(subscribe, getDeps);
@@ -126,22 +146,23 @@ export default function apply(pluginCtx: AtelyxCtx): void {
   }
 
   pluginCtx.effect(() => {
-    // 启动面板与设置页
-    const offView = pluginCtx.slots.registerView({
-      kind: VIEW_KIND,
-      label: "llama.cpp",
-      component: LaunchView,
-    });
+    const views: Array<{ kind: string; label: string; component: () => unknown }> = [
+      { kind: VIEW_LIBRARY, label: "llama.cpp：模型库", component: LibraryPanel },
+      { kind: VIEW_INSTALLED, label: "llama.cpp：已装模型", component: InstalledPanel },
+      { kind: VIEW_LOGS, label: "llama.cpp：日志", component: LogsPanel },
+    ];
+    const offViews = views.map((view) => pluginCtx.slots.registerView(view));
     const offSetting = pluginCtx.slots.registerSetting({
       key: SETTING_KEY,
       label: "llama.cpp",
       component: SettingsPanelView,
     });
     return () => {
-      offView();
+      for (const off of offViews) off();
       offSetting();
-      // 只停轮询；进程树由 Atelyx 在停用/卸载时结束，这里不 cancel
+      // 轮询与下载随插件停用收尾；常驻服务进程由 Atelyx 统一结束，这里不 cancel
       deps?.runtime.stopPolling();
+      deps?.downloader.dispose();
     };
   });
 

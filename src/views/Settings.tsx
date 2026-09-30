@@ -1,12 +1,11 @@
 /**
- * 设置页：全局项——llama-server 文件夹、监听地址、模型目录、端口、进程模式。
- *
- * 逐项改动即生效并落盘（无保存按钮）：改动都是用户明确触发，改完不丢更符合直觉。
- * 选模型与启动参数在启动面板按模型文件夹操作，不在此重复。
+ * 设置页：llama-server 文件夹、监听地址、模型目录、端口、进程模式等全局项。
+ * 逐项改动即生效落盘（无保存按钮）；选模型与启动参数按模型文件夹在「已装模型」里操作，不在此重复。
  */
 import React from "react";
 import type { AtelyxCtx } from "../ctx";
 import { type LlamaSettings, type ProcessMode } from "../settings";
+import { MIRRORS } from "../host/mirrors";
 import {
   Button,
   Card,
@@ -127,11 +126,18 @@ export function SettingsView(props: SettingsProps): unknown {
         </Card>
 
         <Card title="模型">
-          <Field label="模型目录" hint="递归扫描 *.gguf 的根目录。选模型与启动参数在面板的模型区。">
+          <Field label="模型目录" hint="递归扫描 *.gguf 的根目录；下载的模型也落在这里。">
             <div style={{ display: "flex", gap: 6 }}>
               <TextInput value={settings.modelsDir} onChange={(v) => patch({ modelsDir: v })} placeholder="选择或输入模型文件夹" style={{ flex: 1 }} />
               <Button onClick={() => pickFolder("modelsDir")} title="选择模型目录">选择</Button>
             </div>
+          </Field>
+          <Field label="下载镜像站" hint="模型检索与下载使用的站点。国内直连不了 huggingface.co 时用镜像站。">
+            <Select
+              value={settings.downloadMirror}
+              onChange={(v) => patch({ downloadMirror: v })}
+              options={MIRRORS.map((m) => ({ value: m.id, label: m.label }))}
+            />
           </Field>
         </Card>
       </div>

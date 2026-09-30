@@ -1,11 +1,8 @@
 import type { Context } from "@atelyx/cordis";
 
 /**
- * 插件上下文（`ctx`）的最小可用类型面。
- *
- * 只声明本插件实际用到的服务与方法；Atelyx 在加载时按自己的实现注入，
- * 这里的类型仅为本地 `tsc --noEmit` 提供约束。
- * 依赖声明见 `index.tsx`——这里用到的平台服务在插件运行时恒在。
+ * 宿主上下文（`ctx`）的类型面：只声明本插件用到的服务与方法，供本地 `tsc` 校验；
+ * 运行时由 Atelyx 注入，所需服务在插件运行时恒在。
  */
 
 /** 进程输出回调（`ctx.shell.spawn` 传 handlers 时启用）。 */
@@ -19,6 +16,13 @@ export interface ShellStreamHandlers {
 export interface ShellProcessHandle {
   pid: number;
   cancel(): Promise<void>;
+}
+
+/** `ctx.shell.exec` 的聚合结果（非流式：等进程结束一次性给出）。 */
+export interface ShellExecResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
 }
 
 /** 单层目录条目（对应宿主 `external_list_dir`，目录在前、按名升序、含隐藏项）。 */
@@ -51,8 +55,18 @@ export interface AtelyxCtx extends Context {
   /** 仓库外文件面：任意绝对路径（无目录授权门槛，调用由宿主按插件审计）。 */
   fs: {
     listDir(path: string): Promise<ListDirResult>;
+    /** 写文本文件（父目录不存在时宿主会补建）。 */
+    writeFile(path: string, content: string): Promise<{ ok: boolean; summary: string }>;
+    /** 同目录重命名（newName 须为纯文件名；目标已存在会被宿主拒绝）。 */
+    renameFile(path: string, newName: string): Promise<{ ok: boolean; summary: string; actualPath: string }>;
+    /** 删除单个文件。 */
+    deleteFile(path: string): Promise<{ ok: boolean; summary: string }>;
+    /** 本插件私有目录绝对路径（不存在则创建；随卸载清除、更新保留）。 */
+    privateDir(): Promise<string>;
   };
   shell: {
+    /** 非流式执行：等进程结束，聚合 stdout/stderr 与退出码（短任务取数用）。 */
+    exec(opts: { command: string; args?: string[]; cwd?: string; env?: Record<string, string> }): Promise<ShellExecResult | undefined>;
     /** 启动长驻进程并立即拿到句柄（不等进程结束）。 */
     spawn(
       opts: { command: string; args?: string[]; cwd?: string; env?: Record<string, string> },

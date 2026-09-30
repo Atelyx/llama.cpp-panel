@@ -1,8 +1,6 @@
 /**
- * 进程托管的状态中心：启停、就绪判定与运行日志。
- *
- * 与运行时分开：连接是网络层的事，进程是本机的事——用户可能自行启动服务（连接通但非本插件
- * 启动），也可能插件起了进程而服务尚未就绪，界面需要同时看到这两条信息。
+ * 进程托管状态中心：启停、就绪判定与日志，独立于 runtime。
+ * 进程（本机）与连接（网络）是两条信息：用户自起的服务连接通但不归本插件管，界面要同时呈现。
  */
 import type { AtelyxCtx, ShellProcessHandle } from "../ctx";
 import type { LlamaSettings } from "../settings";
@@ -31,8 +29,8 @@ export interface HostSnapshot {
   error: string;
 }
 
-/** 够看启动报错即可，不无限增长。 */
-const MAX_LOGS = 300;
+/** 日志缓冲的裁剪上限（日志页签的页脚文案也用它，避免两份常量各说各话）。 */
+export const MAX_LOGS = 300;
 /** 加载大模型会慢，给足时间但不无限等。 */
 const READY_TIMEOUT_MS = 180000;
 /** 错误输出可能极长，进通知与快照前截断。 */
@@ -143,10 +141,7 @@ export class HostController {
     }
   }
 
-  /**
-   * 启动失败收口：写失败原因并弹通知。用户主动停止以同样的进程退出收场，但那不是失败。
-   * message 优先于 died（覆盖 spawn 直接抛错的场景），再兜底超时。
-   */
+  /** 启动失败收口：写原因并弹通知。主动停止同样以进程退出收场，但那不算失败。 */
   private failStart(message?: string): void {
     if (this.cancelled) {
       this.emit({ starting: false });
@@ -157,12 +152,7 @@ export class HostController {
     this.notifyFailure(msg);
   }
 
-  /**
-   * 启动 llama-server 并等待服务就绪。
-   *
-   * 返回 false 有两种含义——「已有进程/正在启动」与「启动失败」，界面据此分辨：
-   * 失败原因在 error 字段里，而前者不会写 error。
-   */
+  /** 启动并等待服务就绪。返回 false 有两种含义——已有进程/正在启动、启动失败：后者写 error，前者不写。 */
   async start(runtime: LlamaRuntime): Promise<boolean> {
     if (this.snap.starting || this.handle) return false;
     this.died = "";

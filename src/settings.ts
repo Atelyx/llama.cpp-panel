@@ -24,6 +24,8 @@ export interface LlamaSettings {
   mmprojFile: string;
   /** 进程接管方式。 */
   processMode: ProcessMode;
+  /** 模型下载用的镜像站 id（见 host/mirrors 的 MIRRORS）。 */
+  downloadMirror: string;
   /** 各模型文件夹的启动参数，key = 模型文件夹全路径（/ 分隔）。 */
   modelParams: Record<string, ModelLaunchParams>;
 }
@@ -64,6 +66,12 @@ interface PluginState {
 
 const STATE_VERSION = 1;
 
+/**
+ * 默认镜像站 id。写死字符串而不从 host/mirrors 导入：本模块是 settings 层，
+ * 不该依赖 host 层；取值须与 MIRRORS 的首项一致（镜像表里改 id 要同步这里）。
+ */
+const DEFAULT_MIRROR = "hf-mirror";
+
 export const DEFAULT_SETTINGS: LlamaSettings = {
   host: "127.0.0.1",
   port: 8080,
@@ -72,6 +80,7 @@ export const DEFAULT_SETTINGS: LlamaSettings = {
   modelFile: "",
   mmprojFile: "",
   processMode: "managed",
+  downloadMirror: DEFAULT_MIRROR,
   modelParams: {},
 };
 
@@ -126,6 +135,7 @@ function coerce(raw: unknown): LlamaSettings {
     modelFile: str("modelFile", DEFAULT_SETTINGS.modelFile).trim(),
     mmprojFile: str("mmprojFile", DEFAULT_SETTINGS.mmprojFile).trim(),
     processMode: mode === "external" ? "external" : "managed",
+    downloadMirror: str("downloadMirror", DEFAULT_SETTINGS.downloadMirror).trim() || DEFAULT_MIRROR,
     modelParams: coerceParams(source.modelParams),
   };
 }

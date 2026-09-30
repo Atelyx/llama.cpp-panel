@@ -1,14 +1,9 @@
 /**
- * 启动命令组装：把设置拼成 llama-server 的进程参数。
+ * 启动命令组装与可执行文件定位。
  *
- * 两条约束决定实现：
- * 1. 可执行程序只有 cmd.exe（Windows）/ sh（Unix）登记，启动命令必须写成整行经
- *    /C、-c 转达，不能直接指定 llama-server 本身。
- * 2. 包装层是 cmd.exe/sh —— 只结束包装进程会把真正的服务留成孤儿，因此经 spawn
- *    拿到的句柄 cancel() 结束整棵进程树，而不是按命令行特征找进程。
- *
- * 用户选的是 llama-server 所在文件夹而不是可执行文件本身：同一份发布里可执行文件名
- * 随平台变（Windows 带 .exe），让代码按平台名去文件夹里找，用户换平台不必重选。
+ * 两条约束：进程白名单只放行 cmd.exe / sh，llama-server 必须经包装层（/C、-c）转达；
+ * 包装层会留下孤儿，故句柄 cancel() 结束整棵进程树，不按命令行特征找进程。
+ * 用户选的是文件夹而非可执行文件——发布里文件名随平台变（Windows 带 .exe），按平台名去文件夹里找。
  */
 import type { AtelyxCtx, ListDirResult, ShellStreamHandlers, ShellProcessHandle } from "../ctx";
 import { paramsFor, type LlamaSettings } from "../settings";
@@ -165,10 +160,8 @@ export interface StartHandlers {
 }
 
 /**
- * 启动 llama-server 并返回句柄。
- *
- * 句柄须由调用方保存：llama-server 是长驻服务，只能靠它停下。工作目录取模型所在目录，
- * 让 llama-server 的相对路径（如缓存）落到模型目录旁。
+ * 启动 llama-server 并返回句柄（长驻服务，只能靠句柄停下，调用方须保存）。
+ * 工作目录取模型所在目录，让 llama-server 的相对路径（如缓存）落到模型目录旁。
  */
 export async function startLlama(
   ctx: AtelyxCtx,

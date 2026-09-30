@@ -1,8 +1,6 @@
 /**
- * 连接状态中心：探测本机 llama-server 的 HTTP API，判定 direct/offline。
- *
- * llama-server 无队列/生成结果要轮询，只关心「服务在不在」——因此只需 HTTP 探测，
- * 不做长连接。轮询保持状态新鲜（服务崩了能感知），探测失败不抛断。
+ * 连接状态中心：HTTP 探测本机 llama-server，判定 direct/offline。
+ * 只关心「服务在不在」，故无长连接；轮询保持状态新鲜，探测失败一律落 offline 而不抛。
  */
 import { baseUrl, type LlamaSettings } from "./settings";
 

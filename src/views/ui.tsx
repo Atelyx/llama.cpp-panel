@@ -1,8 +1,6 @@
 /**
  * 界面原语：面板共用的样式与小组件。
- *
- * 样式只用内联 style + Atelyx的 CSS 变量，不依赖 Tailwind（插件没有构建期的类名提取，
- * Tailwind 类不会生效）；颜色走变量而非硬编码，才能跟随用户主题变化。
+ * 只用内联 style + 宿主 CSS 变量：插件没有构建期类名提取，Tailwind 不生效；颜色走变量才能跟随主题。
  */
 import React from "react";
 
@@ -300,6 +298,8 @@ export function Empty(props: { children: unknown; hint?: unknown }): unknown {
 export function TextInput(props: {
   value: string;
   onChange: (value: string) => void;
+  /** 回车提交（如检索框）。 */
+  onEnter?: () => void;
   placeholder?: string;
   type?: string;
   min?: number;
@@ -323,6 +323,9 @@ export function TextInput(props: {
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
       onChange={(e: { target: { value: string } }) => props.onChange(e.target.value)}
+      onKeyDown={(e: { key: string }) => {
+        if (e.key === "Enter") props.onEnter?.();
+      }}
       style={{
         width: "100%",
         boxSizing: "border-box",
