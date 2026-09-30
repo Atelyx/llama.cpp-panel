@@ -23,7 +23,8 @@ import {
 } from "../host/models";
 import {
   SCROLL_LIST_CLASS,
-  SCROLLBAR_CSS,
+  MODEL_ROW_CLASS,
+  PANEL_CSS,
   SearchIcon,
   PlayIcon,
   SquareIcon,
@@ -127,8 +128,9 @@ function optionalInt(v: string, min: number): number | null {
   return Number.isInteger(n) && n >= min ? n : null;
 }
 
-/** 模型栏与参数栏并排所需的最小宽度；低于它改为上下堆叠。 */
-const TWO_COLUMN_MIN_WIDTH = 640;
+/** 模型栏宽度：并排时参数栏至少也要这么宽，故两栏并排需要面板宽度达到它的两倍。 */
+const MODELS_PANE_WIDTH = 340;
+const TWO_COLUMN_MIN_WIDTH = MODELS_PANE_WIDTH * 2;
 
 /**
  * 按面板自身宽度决定上下两栏是并排还是堆叠：并排需要横向空间，窄到放不下时
@@ -296,7 +298,7 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
 
   return (
     <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden", background: bgPrimary, color: textPrimary, fontSize: FONT_SM, boxSizing: "border-box" }}>
-      <style>{SCROLLBAR_CSS}</style>
+      <style>{PANEL_CSS}</style>
 
       <Toolbar>
         <StatusDot
@@ -316,9 +318,6 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
             </Button>
           </>
         )}
-        <Button onClick={runScan} title="重新扫描模型目录" disabled={modelsLoading}>
-          <RefreshIcon size={12} /> 扫描
-        </Button>
       </Toolbar>
 
       <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -327,7 +326,7 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
           {/* 模型选择：堆叠时 2 份高度（基数为 0，两栏按 2:3 分上半区） */}
           <div
             style={{
-              flex: isStacked ? "2 1 0" : "0 1 300px",
+              flex: isStacked ? "2 1 0" : `0 1 ${MODELS_PANE_WIDTH}px`,
               minWidth: isStacked ? 0 : 220,
               minHeight: 0,
               display: "flex",
@@ -363,7 +362,8 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
                   <TextInput
                     value={modelFilter}
                     onChange={setModelFilter}
-                    placeholder={`过滤 ${filtered.length}/${folders.length} 个模型文件夹`}
+                    placeholder={`过滤 ${filtered.length}/${folders.length} 个模型`}
+                    title="按文件夹名过滤模型"
                     style={{ paddingLeft: 32 }}
                   />
                 </div>
@@ -372,6 +372,9 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
                     清除
                   </Button>
                 ) : null}
+                <Button onClick={runScan} disabled={modelsLoading} title="重新扫描模型目录">
+                  <RefreshIcon size={12} /> 扫描
+                </Button>
               </div>
             )}
 
@@ -408,6 +411,7 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
                       key={f.rel}
                       onClick={() => selectFolder(f)}
                       title={f.full}
+                      className={MODEL_ROW_CLASS}
                       style={{
                         display: "flex",
                         alignItems: "center",
@@ -416,7 +420,9 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
                         borderRadius: 6,
                         cursor: "pointer",
                         border: `1px solid ${selected ? accent : border}`,
-                        background: selected ? hover : "transparent",
+                        // 未选中不写 background：行内样式会压过样式表的 :hover，悬停底色就失效了
+                        background: selected ? hover : undefined,
+                        transition: "background-color 120ms ease",
                         color: textPrimary,
                         fontSize: FONT_SM,
                         lineHeight: 1.6,
@@ -425,21 +431,33 @@ export function LaunchPanel(props: LaunchPanelProps): unknown {
                       <span style={{ flexShrink: 0, color: selected ? accent : textMuted }}>
                         <ImageIcon size={14} />
                       </span>
-                      <span
-                        style={{
-                          flex: 1,
-                          minWidth: 0,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          fontWeight: selected ? 600 : 400,
-                        }}
-                      >
-                        {dir ? <span style={{ color: textMuted }}>{`${dir}/`}</span> : null}
-                        {base}
-                      </span>
-                      <span style={{ flexShrink: 0, color: textMuted, fontSize: 11 }}>
-                        {`${f.quants.length} 个量化${f.mms.length > 0 ? ` · ${f.mms.length} 投影` : ""}${hasSize ? ` · ${formatSize(totalBytes)}` : ""}`}
+                      <span style={{ flex: 1, minWidth: 0 }}>
+                        <span
+                          style={{
+                            display: "block",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                            fontWeight: selected ? 600 : 400,
+                          }}
+                        >
+                          {dir ? <span style={{ color: textMuted }}>{`${dir}/`}</span> : null}
+                          {base}
+                        </span>
+                        <span
+                          style={{
+                            display: "block",
+                            marginTop: 2,
+                            color: textMuted,
+                            fontSize: 11,
+                            lineHeight: 1.4,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {`${f.quants.length} 个量化${f.mms.length > 0 ? ` · ${f.mms.length} 投影` : ""}${hasSize ? ` · ${formatSize(totalBytes)}` : ""}`}
+                        </span>
                       </span>
                     </div>
                   );

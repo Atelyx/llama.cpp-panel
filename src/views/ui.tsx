@@ -20,12 +20,16 @@ export const danger = "#e5534b";
 export const FONT_SM = 12;
 export const FONT_MD = 13;
 
-/** 滚动区类名与显式可见的滚动条样式：宿主主题可能隐藏滚动条，滚动区需要自带。 */
+/** 滚动区类名：宿主主题可能隐藏滚动条，滚动区要自带可见滚动条（外观见 PANEL_CSS）。 */
 export const SCROLL_LIST_CLASS = "lp-scroll-list";
-export const SCROLLBAR_CSS = `
+/** 模型条目类名：悬停底色只能走样式表——行内 background 会压过 `:hover`。 */
+export const MODEL_ROW_CLASS = "lp-model-row";
+/** 内联 style 表达不了的规则：滚动条外观与模型条目的悬停底色。 */
+export const PANEL_CSS = `
 .lp-scroll-list::-webkit-scrollbar { width: 10px; height: 10px; }
 .lp-scroll-list::-webkit-scrollbar-track { background: transparent; }
 .lp-scroll-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+.lp-model-row:hover { background: var(--hover); }
 `;
 
 /** 图标基座（lucide 的 24×24 线性风格）；不引图标库，图标即几条 path。 */
