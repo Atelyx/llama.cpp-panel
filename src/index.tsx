@@ -120,7 +120,7 @@ export default function apply(pluginCtx: AtelyxCtx): void {
     if (!ready) return <InitPlaceholder />;
     return (
       <PanelShell>
-        <SettingsView ctx={ready.ctx} runtime={ready.runtime} host={ready.host} settings={ready.settings} onSettingsChanged={ready.onSettingsChanged} />
+        <SettingsView ctx={ready.ctx} settings={ready.settings} onSettingsChanged={ready.onSettingsChanged} />
       </PanelShell>
     );
   }
