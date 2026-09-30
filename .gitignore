@@ -9,9 +9,6 @@ dist/
 # 插件运行时数据（本地目录安装时写在插件目录内，属本机数据不进仓库）
 data/
 
-# 个性化声明目录（模型库在本机磁盘的具体路径，见 scripts/apply-declared-dirs.mjs）
-declaredDirs.local.json
-
 # 编辑器 / 系统
 .vscode/
 .idea/
