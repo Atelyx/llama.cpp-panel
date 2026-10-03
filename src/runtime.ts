@@ -27,6 +27,8 @@ export class LlamaRuntime {
   private snapshot: RuntimeSnapshot = { channel: "offline" };
   private readonly listeners = new Set<() => void>();
   private timer: number | null = null;
+  /** 挂起时端口由占位监听持有，任何探测都会把自己触发成启动：轮询与探测全部短路。 */
+  private suspended = false;
 
   constructor(settings: LlamaSettings) {
     this.settings = settings;
@@ -43,7 +45,19 @@ export class LlamaRuntime {
 
   applySettings(settings: LlamaSettings): void {
     this.settings = settings;
-    void this.probeOnce();
+    if (!this.suspended) void this.probeOnce();
+  }
+
+  /** 挂起/恢复：挂起即停轮询、探测短路；恢复时重启轮询并立即探测。 */
+  setSuspended(suspended: boolean): void {
+    if (suspended === this.suspended) return;
+    this.suspended = suspended;
+    if (suspended) {
+      this.stopPolling();
+    } else {
+      this.startPolling();
+      void this.probe();
+    }
   }
 
   /** 探测并更新状态。可重复调用（轮询/手动重检都走它）。 */
@@ -77,6 +91,7 @@ export class LlamaRuntime {
   }
 
   private async probeOnce(): Promise<Channel> {
+    if (this.suspended) return this.channel;
     const base = baseUrl(this.settings);
     for (const path of PROBE_PATHS) {
       try {

@@ -135,7 +135,7 @@ function dirname(path: string): string {
 }
 
 /** 含空白或引号时加引号（仅用于展示与 Unix 的 -c 串）。 */
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   return /[\s"\\]/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value;
 }
 

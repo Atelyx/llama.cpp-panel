@@ -2,8 +2,8 @@
  * 插件入口：注册三个页签（模型库 / 已装模型 / 日志）、设置页与命令。
  *
  * runtime 与 host 在 apply 期间各建一次，页签只消费快照——页签拆到不同面板也共享同一份
- * 连接状态、进程状态与下载任务。进程收尾归 Atelyx，这里只停轮询与下载，不 cancel 长期进程，
- * 以免误杀用户自起的外部服务。
+ * 连接状态、进程状态与下载任务。进程收尾归 Atelyx，这里只解除待命、停轮询与下载，
+ * 不 cancel 长期进程，以免误杀用户自起的外部服务。
  */
 import React from "react";
 import type { AtelyxCtx } from "./ctx";
@@ -51,12 +51,11 @@ export default function apply(pluginCtx: AtelyxCtx): void {
     for (const listener of listeners) listener();
   };
 
-  // 设置变更的统一收口：更新 runtime/host 的内存设置并重建 deps（换引用触发重渲），再落盘。
-  // 各页签的每模型参数、镜像站与设置页的全局项都走这条路。
+  // 设置变更收口：host 先裁决（待命路径会挂起探测），runtime 再更新——反了会自己触发自己；最后重渲并落盘。
   const onSettingsChanged = (next: LlamaSettings): void => {
     if (deps) {
-      deps.runtime.applySettings(next);
       deps.host.applySettings(next);
+      deps.runtime.applySettings(next);
       // 换一个新对象引用，getDeps 返回的快照才变化，useSyncExternalStore 才会重渲
       deps = { ...deps, settings: next };
     }
@@ -67,15 +66,16 @@ export default function apply(pluginCtx: AtelyxCtx): void {
   void loadSettings(pluginCtx)
     .then((loaded) => {
       const runtime = new LlamaRuntime(loaded);
-      const host = new HostController(pluginCtx, loaded);
+      const host = new HostController(pluginCtx, loaded, runtime);
       const downloader = new Downloader(pluginCtx);
       deps = { ctx: pluginCtx, runtime, host, downloader, settings: loaded, onSettingsChanged };
 
       // 常驻轮询保持连接状态新鲜
       runtime.startPolling();
 
-      // 首次立即探测一次：给界面一个即时连接状态
-      void runtime.probe();
+      // 首次探测出结果后做一次待命裁决：加载期若服务本就未运行，探测结果无变化、
+      // 不会产生状态事件，必须显式裁决一次才会进入待命
+      void runtime.probe().then(() => host.evaluateWatcher());
       notify();
     })
     .catch((err: unknown) => {
@@ -160,7 +160,8 @@ export default function apply(pluginCtx: AtelyxCtx): void {
     return () => {
       for (const off of offViews) off();
       offSetting();
-      // 轮询与下载随插件停用收尾；常驻服务进程由 Atelyx 统一结束，这里不 cancel
+      // 轮询、下载与自动启动待命随插件停用收尾；常驻服务进程由 Atelyx 统一结束，这里不 cancel
+      deps?.host.dispose();
       deps?.runtime.stopPolling();
       deps?.downloader.dispose();
     };

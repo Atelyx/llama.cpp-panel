@@ -5,6 +5,7 @@
 import type { AtelyxCtx, ShellProcessHandle } from "../ctx";
 import type { LlamaSettings } from "../settings";
 import type { LlamaRuntime } from "../runtime";
+import { ApiCallWatcher, type WatchHooks } from "./watcher";
 import {
   describeStartCommand,
   findServerExecutable,
@@ -19,6 +20,8 @@ export interface HostSnapshot {
   running: boolean;
   /** 正在启动（等接口就绪）。 */
   starting: boolean;
+  /** 自动启动待命中：占位进程正监听服务端口，外部调用将触发启动。 */
+  watch: boolean;
   /** 展示将要执行的命令，便于用户确认。 */
   startLine: string;
   /** 尾部若干行日志。 */
@@ -39,6 +42,7 @@ const ERROR_DETAIL_MAX = 200;
 const EMPTY: HostSnapshot = {
   running: false,
   starting: false,
+  watch: false,
   startLine: "",
   logs: [],
   logSeq: 0,
@@ -48,6 +52,8 @@ const EMPTY: HostSnapshot = {
 export class HostController {
   private readonly ctx: AtelyxCtx;
   private settings: LlamaSettings;
+  private readonly runtime: LlamaRuntime;
+  private readonly watcher: ApiCallWatcher;
   private readonly listeners = new Set<() => void>();
   private snap: HostSnapshot = EMPTY;
   /** 首次用到时向 Atelyx 问一次并缓存。 */
@@ -64,11 +70,34 @@ export class HostController {
   private notified = false;
   /** 本次启动是否被用户主动停止：收场同样是进程退出，但不是失败。 */
   private cancelled = false;
+  /** 自动启动暂缓：启动失败或待命异常后置位，手动启动或功能开启下的设置变更时清位。 */
+  private watchPaused = false;
+  /** 每轮暂缓最多提示一次；恢复待命能力后重新允许提示。 */
+  private watchPauseNotified = false;
+  private disposed = false;
 
-  constructor(ctx: AtelyxCtx, settings: LlamaSettings) {
+  constructor(ctx: AtelyxCtx, settings: LlamaSettings, runtime: LlamaRuntime) {
     this.ctx = ctx;
     this.settings = settings;
+    this.runtime = runtime;
+    this.watcher = new ApiCallWatcher(ctx);
+    // 探测状态变化时重新裁决：外部起的服务下线 → 进入待命；在线 → 不占它的端口
+    runtime.subscribe(() => this.evaluateWatcher());
   }
+
+  /** 触发/异常回调收口：先收敛快照状态，再交给各自流程。 */
+  private readonly watchHooks: WatchHooks = {
+    onTrigger: (requestLine) => {
+      if (this.disposed) return;
+      if (this.snap.watch) this.emit({ watch: false });
+      void this.autoStart(requestLine);
+    },
+    onBroken: (reason) => {
+      if (this.disposed) return;
+      if (this.snap.watch) this.emit({ watch: false });
+      this.pauseAutoStart(reason);
+    },
+  };
 
   private async getPlatform(): Promise<Platform> {
     if (this.platform === null) this.platform = await resolvePlatform(this.ctx);
@@ -84,6 +113,95 @@ export class HostController {
 
   applySettings(settings: LlamaSettings): void {
     this.settings = settings;
+    // 功能开启下的设置变更是用户重新表态：清掉暂缓，让待命按新设置重新裁决
+    if (settings.autoStartOnApiCall && settings.processMode === "managed") {
+      this.watchPaused = false;
+      this.watchPauseNotified = false;
+    }
+    this.evaluateWatcher();
+  }
+
+  /** 待命裁决唯一入口：装载完成后的首次裁决、进程启停、设置变更、探测变化都经此收敛。 */
+  evaluateWatcher(): void {
+    if (this.disposed) return;
+    if (this.watchDesired()) {
+      // 先挂起探测再起占位进程：否则探测会打进占位监听、把自己触发成启动
+      this.runtime.setSuspended(true);
+      void this.getPlatform()
+        .then((platform) => this.watcher.arm(platform, this.settings, this.watchHooks))
+        .then((result) => {
+          if (!result.ok) {
+            this.pauseAutoStart(result.error ?? "待命进程未能启动");
+            return;
+          }
+          if (this.disposed || !this.watcher.isArmed() || this.snap.watch) return;
+          // 排队落地期间状态可能已变：按当前状态重新裁决
+          if (!this.watchDesired()) {
+            this.evaluateWatcher();
+            return;
+          }
+          this.emit({ watch: true });
+          this.log(`自动启动待命中：监听 ${this.settings.host}:${this.settings.port}，外部调用将自动启动`);
+        })
+        .catch((err: unknown) => this.pauseAutoStart(describe(err)));
+    } else {
+      // 先杀占位进程再恢复探测，顺序反了恢复的首个探测会把自己触发成启动
+      void this.watcher.disarm().then((wasArmed) => {
+        this.runtime.setSuspended(false);
+        if (wasArmed) {
+          this.emit({ watch: false });
+          this.log("已退出自动启动待命");
+        }
+      });
+    }
+  }
+
+  /** 应待命 = 功能开 && 托管模式 && 服务未运行且未在启动 && 未暂缓 && 探测未连接。 */
+  private watchDesired(): boolean {
+    return (
+      this.settings.autoStartOnApiCall &&
+      this.settings.processMode === "managed" &&
+      !this.handle &&
+      !this.snap.starting &&
+      !this.watchPaused &&
+      !this.runtime.isOnline()
+    );
+  }
+
+  /** 自动启动暂缓：失败原因持久（缺模型、端口被占等），重试无意义；手动启动或设置变更时恢复。 */
+  private pauseAutoStart(reason: string): void {
+    if (this.disposed) return;
+    this.watchPaused = true;
+    this.runtime.setSuspended(false);
+    if (this.snap.watch) this.emit({ watch: false });
+    this.log(`自动启动已暂缓：${reason}`);
+    if (this.watchPauseNotified) return;
+    this.watchPauseNotified = true;
+    try {
+      this.ctx.notification.notify({
+        level: "warning",
+        title: "外部调用自动启动已暂缓",
+        message: `${reason}。手动启动服务或修改设置后会恢复待命。`,
+      });
+    } catch {
+      // 通知通道异常不改变暂缓结论
+    }
+  }
+
+  /** 外部调用触发：提示后复用普通启动流程。 */
+  private async autoStart(requestLine: string): Promise<void> {
+    const detail = requestLine ? `（${requestLine}）` : "";
+    this.log(`检测到外部 API 调用${detail}，正在启动 llama-server…`);
+    try {
+      this.ctx.notification.notify({
+        level: "info",
+        title: "llama.cpp",
+        message: `检测到外部 API 调用${detail}，正在启动 llama-server…`,
+      });
+    } catch {
+      // 通知失败不影响启动
+    }
+    await this.start(this.runtime);
   }
 
   private emit(patch: Partial<HostSnapshot>): void {
@@ -150,11 +268,20 @@ export class HostController {
     const msg = message || this.died || `启动后 ${Math.round(READY_TIMEOUT_MS / 1000)}s 内服务未就绪`;
     this.emit({ starting: false, error: msg });
     this.notifyFailure(msg);
+    // 启动失败后暂缓自动启动：原因持久，重试无意义
+    this.watchPaused = true;
   }
 
   /** 启动并等待服务就绪。返回 false 有两种含义——已有进程/正在启动、启动失败：后者写 error，前者不写。 */
   async start(runtime: LlamaRuntime): Promise<boolean> {
     if (this.snap.starting || this.handle) return false;
+    // starting 先行同步置位：手动启动与自动触发并发时，第二个 start 会被这个挡住
+    this.emit({ starting: true });
+    this.watchPaused = false;
+    this.watchPauseNotified = false;
+    // 占位监听持有端口时 llama-server 绑不上，启动前必须先让它退出
+    if (await this.watcher.disarm()) this.emit({ watch: false });
+    this.runtime.setSuspended(false);
     this.died = "";
     this.lastStderr = "";
     this.notified = false;
@@ -170,12 +297,18 @@ export class HostController {
       exe = found;
       line = describeStartCommand(this.settings, exe);
     } catch (err) {
-      const message = describe(err);
-      this.emit({ error: message });
-      this.notifyFailure(message);
+      this.failStart(describe(err));
+      this.evaluateWatcher();
       return false;
     }
-    this.emit({ starting: true, error: "", startLine: line, logs: [] });
+    // 定位可执行文件的窗口里用户叫停（stop 拿不到句柄）：不再拉起进程
+    if (this.cancelled) {
+      this.emit({ starting: false });
+      this.evaluateWatcher();
+      return false;
+    }
+
+    this.emit({ error: "", startLine: line, logs: [] });
 
     try {
       const handle = await startLlama(
@@ -197,6 +330,8 @@ export class HostController {
             this.died = `进程已退出（退出码 ${code ?? "未知"}）${detail}`;
             this.emit({ running: false });
             this.log(`进程已退出（退出码 ${code ?? "未知"}）`, "stderr");
+            // 进程退出后重新裁决，待命自动恢复
+            this.evaluateWatcher();
           },
           onError: (message) => {
             this.handle = null;
@@ -205,6 +340,7 @@ export class HostController {
             if (this.snap.starting) this.emit({ running: false });
             else this.emit({ running: false, error: message });
             this.log(message, "stderr");
+            this.evaluateWatcher();
           },
         },
       );
@@ -223,10 +359,11 @@ export class HostController {
     const ready = await this.waitReady(runtime);
     if (ready) this.emit({ starting: false });
     else this.failStart();
+    this.evaluateWatcher();
     return ready;
   }
 
-  /** 停止本插件启动的进程（结束整棵进程树，不给服务留孤儿）。 */
+  /** 停止本插件启动的进程（结束整棵进程树，不给服务留孤儿）。待命不随停止解除：进程退出后自动重新待命。 */
   async stop(): Promise<void> {
     // 等就绪期间用户叫停：别让 start() 把这次退出当成启动失败
     if (this.snap.starting) this.cancelled = true;
@@ -244,6 +381,12 @@ export class HostController {
       this.handle = null;
       this.emit({ running: false, starting: false });
     }
+  }
+
+  /** 插件停用/卸载：解除待命并忽略后续触发；进程收尾归宿主。 */
+  dispose(): void {
+    this.disposed = true;
+    void this.watcher.disarm();
   }
 }
 

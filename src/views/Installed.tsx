@@ -79,6 +79,8 @@ export function InstalledView(props: InstalledProps): unknown {
     if (hostSnapshot.starting)
       return { tone: "warn", label: "启动中", title: "进程已拉起，正在等待 llama-server 接口就绪" };
     if (hostSnapshot.running) return { tone: "ok", label: "运行中", title: "本插件启动的 llama-server 正在运行" };
+    if (hostSnapshot.watch)
+      return { tone: "warn", label: "待命中", title: "自动启动待命：检测到外部 API 调用即自动启动服务" };
     if (hostSnapshot.error) return { tone: "bad", label: "启动失败", title: hostSnapshot.error };
     if (isExternal) return { tone: "idle", label: "未接管", title: "外部模式：进程归你管，只看连接状态" };
     return { tone: "idle", label: "已停止", title: "未运行" };

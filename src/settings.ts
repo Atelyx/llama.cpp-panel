@@ -24,6 +24,8 @@ export interface LlamaSettings {
   mmprojFile: string;
   /** 进程接管方式。 */
   processMode: ProcessMode;
+  /** 外部调用自动启动（仅托管模式）：服务未运行时插件占位监听服务端口，检测到外部请求即自动启动。 */
+  autoStartOnApiCall: boolean;
   /** 模型下载用的镜像站 id（见 host/mirrors 的 MIRRORS）。 */
   downloadMirror: string;
   /** 各模型文件夹的启动参数，key = 模型文件夹全路径（/ 分隔）。 */
@@ -80,6 +82,7 @@ export const DEFAULT_SETTINGS: LlamaSettings = {
   modelFile: "",
   mmprojFile: "",
   processMode: "managed",
+  autoStartOnApiCall: false,
   downloadMirror: DEFAULT_MIRROR,
   modelParams: {},
 };
@@ -135,6 +138,7 @@ function coerce(raw: unknown): LlamaSettings {
     modelFile: str("modelFile", DEFAULT_SETTINGS.modelFile).trim(),
     mmprojFile: str("mmprojFile", DEFAULT_SETTINGS.mmprojFile).trim(),
     processMode: mode === "external" ? "external" : "managed",
+    autoStartOnApiCall: source.autoStartOnApiCall === true,
     downloadMirror: str("downloadMirror", DEFAULT_SETTINGS.downloadMirror).trim() || DEFAULT_MIRROR,
     modelParams: coerceParams(source.modelParams),
   };

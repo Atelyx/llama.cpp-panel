@@ -9,6 +9,7 @@ import { MIRRORS } from "../host/mirrors";
 import {
   Button,
   Card,
+  Checkbox,
   Field,
   Notice,
   Select,
@@ -121,6 +122,17 @@ export function SettingsView(props: SettingsProps): unknown {
                 { value: "managed", label: "托管（本插件启停）" },
                 { value: "external", label: "外部（只检测连接）" },
               ]}
+            />
+          </Field>
+          <Field
+            label="外部调用自动启动"
+            hint="仅托管模式生效。服务未运行时插件占位监听端口，检测到外部请求（首页除外）即自动启动并转发该请求；请勿在待命期间于插件外自行启动 llama-server。自动启动失败后会暂缓，手动启动或改设置即恢复。"
+          >
+            <Checkbox
+              checked={settings.autoStartOnApiCall}
+              disabled={isExternal}
+              onChange={(checked) => patch({ autoStartOnApiCall: checked })}
+              label={isExternal ? "外部模式下不可用" : "服务未运行时，检测到外部 API 调用即自动启动"}
             />
           </Field>
         </Card>
