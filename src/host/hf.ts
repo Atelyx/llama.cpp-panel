@@ -11,9 +11,6 @@ import { num, type ModelSummary, type RepoDetail, type RepoFile } from "./types"
 /** 检索结果的排序方式。 */
 export type SearchSort = "downloads" | "likes" | "lastModified";
 
-/** 模型卡简介的展示上限（够看出用途即可，过长会把详情页挤满）。 */
-const README_MAX_CHARS = 4000;
-
 interface RawModel {
   id?: unknown;
   modelId?: unknown;
@@ -98,7 +95,10 @@ async function fetchReadme(ctx: AtelyxCtx, mirror: MirrorSource, repo: string): 
     // `/raw/` 回的是 Markdown 正文而不是 JSON，按纯文本取；缺失时服务端给 404 + --fail 非零码
     const result = await runCurl(ctx, { url: readmeUrl(mirror, repo) });
     if (result.code !== 0) return "";
-    return stripMarkdown(result.stdout);
+    return result
+      .stdout.replace(/^\uFEFF/, "")
+      // YAML front matter（许可证、语言等元数据）不是正文，不参与渲染
+      .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
   } catch {
     return "";
   }
@@ -115,28 +115,4 @@ export async function fetchRemoteInfo(ctx: AtelyxCtx, url: string): Promise<numb
   const sizes = [...result.stdout.matchAll(/^content-length:\s*(\d+)\s*$/gim)].map((m) => Number(m[1]));
   const size = sizes.length > 0 ? sizes[sizes.length - 1] : null;
   return size && size > 0 ? size : null;
-}
-
-/**
- * 剥掉 Markdown 记号并截断（详情页按纯文本展示）。只去成对的强调记号：量化名里的下划线
- * （`Q4_K_M`）是有效字符，全文标点清洗会把最有用的信息弄坏。
- */
-export function stripMarkdown(text: string): string {
-  return text
-    .replace(/^\uFEFF/, "")
-    .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "") // YAML front matter（许可证、语言等元数据）
-    .replace(/```[\s\S]*?```/g, " ") // 代码块
-    .replace(/<[^>]+>/g, " ") // HTML 标签（模型卡的徽章、表格残留）
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ") // 图片
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // 链接保留文字
-    .replace(/^#{1,6}\s*/gm, "") // 标题井号
-    .replace(/^\s*[-*+]\s+/gm, "· ") // 列表项
-    .replace(/\*\*([^*]+)\*\*/g, "$1") // 加粗
-    .replace(/(^|\W)__([^_]+)__/g, "$1$2")
-    .replace(/(^|\W)\*([^*\n]+)\*/g, "$1$2") // 斜体
-    .replace(/`([^`]*)`/g, "$1") // 行内代码保留内容
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim()
-    .slice(0, README_MAX_CHARS);
 }

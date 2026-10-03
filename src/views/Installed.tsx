@@ -17,10 +17,8 @@ import {
   ImageIcon,
   MODEL_ROW_CLASS,
   Notice,
-  PANEL_CSS,
   PlayIcon,
   RefreshIcon,
-  SCROLL_LIST_CLASS,
   SearchIcon,
   SectionTitle,
   SquareIcon,
@@ -29,12 +27,13 @@ import {
   Toolbar,
   accent,
   bgPrimary,
-  bgSecondary,
   border,
+  fontMicro,
+  fontUi,
   hover,
   textMuted,
   textPrimary,
-  FONT_SM,
+  useSplitLayout,
 } from "./ui";
 
 interface InstalledProps {
@@ -47,27 +46,10 @@ interface InstalledProps {
 
 /** 模型栏宽度：并排时参数栏至少也要这么宽，故两栏并排需要面板宽度达到它的两倍。 */
 const MODELS_PANE_WIDTH = 340;
-const TWO_COLUMN_MIN_WIDTH = MODELS_PANE_WIDTH * 2;
-
-/** 按面板自身宽度决定上下两栏是并排还是堆叠（窄面板下并排会把输入压成窄条）。 */
-function useStackedLayout(): { ref: { current: HTMLDivElement | null }; isStacked: boolean } {
-  const ref = React.useRef<HTMLDivElement | null>(null);
-  const [isStacked, setIsStacked] = React.useState(false);
-  React.useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = (): void => setIsStacked(el.clientWidth < TWO_COLUMN_MIN_WIDTH);
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-  return { ref, isStacked };
-}
 
 export function InstalledView(props: InstalledProps): unknown {
   const { ctx, runtime, host, settings, onSettingsChanged } = props;
-  const { ref: layoutRef, isStacked } = useStackedLayout();
+  const { ref: layoutRef, stacked: isStacked } = useSplitLayout(MODELS_PANE_WIDTH * 2);
   const runtimeSnapshot = React.useSyncExternalStore(runtime.subscribe, runtime.getSnapshot);
   const hostSnapshot: HostSnapshot = React.useSyncExternalStore(host.subscribe, host.getSnapshot);
 
@@ -142,8 +124,7 @@ export function InstalledView(props: InstalledProps): unknown {
   };
 
   return (
-    <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden", background: bgPrimary, color: textPrimary, fontSize: FONT_SM, boxSizing: "border-box" }}>
-      <style>{PANEL_CSS}</style>
+    <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden", background: bgPrimary, color: textPrimary, fontSize: fontUi, boxSizing: "border-box" }}>
       <Toolbar>
         <StatusDot
           tone={online ? "ok" : "idle"}
@@ -218,20 +199,20 @@ export function InstalledView(props: InstalledProps): unknown {
 
           <div
             style={{ flex: 1, minHeight: 0, overflowY: "auto", scrollbarGutter: "stable", display: "flex", flexDirection: "column", gap: 4, padding: "4px 10px 8px" }}
-            className={SCROLL_LIST_CLASS}
+            
           >
             {loading ? (
               <div style={{ padding: 12, color: textMuted }}>扫描中…</div>
             ) : !settings.modelsDir ? (
               <Empty>
                 未设置模型目录。
-                <div style={{ fontSize: 11 }}>到本插件的设置页选择模型目录；扫描会递归找出里面的 .gguf 模型文件夹。</div>
+                <div style={{ fontSize: fontMicro }}>到本插件的设置页选择模型目录；扫描会递归找出里面的 .gguf 模型文件夹。</div>
               </Empty>
             ) : folders.length === 0 ? (
               error ? null : (
                 <Empty>
                   未发现含 .gguf 的模型文件夹。
-                  <div style={{ fontSize: 11 }}>可在「模型库」页签搜索并下载模型，或确认目录里确有 gguf 文件。</div>
+                  <div style={{ fontSize: fontMicro }}>可在「模型库」页签搜索并下载模型，或确认目录里确有 gguf 文件。</div>
                 </Empty>
               )
             ) : filtered.length === 0 ? (
@@ -260,7 +241,7 @@ export function InstalledView(props: InstalledProps): unknown {
                       background: isSelected ? hover : undefined,
                       transition: "background-color 120ms ease",
                       color: textPrimary,
-                      fontSize: FONT_SM,
+                      fontSize: fontUi,
                       lineHeight: 1.6,
                     }}
                   >
@@ -272,7 +253,7 @@ export function InstalledView(props: InstalledProps): unknown {
                         {dir ? <span style={{ color: textMuted }}>{`${dir}/`}</span> : null}
                         {base}
                       </span>
-                      <span style={{ display: "block", marginTop: 2, color: textMuted, fontSize: 11, lineHeight: 1.4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <span style={{ display: "block", marginTop: 2, color: textMuted, fontSize: fontMicro, lineHeight: 1.4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {`${folder.quants.length} 个量化${folder.mms.length > 0 ? ` · ${folder.mms.length} 投影` : ""}${hasSize ? ` · ${formatSize(totalBytes)}` : ""}`}
                       </span>
                     </span>
@@ -283,7 +264,7 @@ export function InstalledView(props: InstalledProps): unknown {
           </div>
         </div>
 
-        <div style={{ flex: isStacked ? "3 1 0" : 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", background: bgSecondary }}>
+        <div style={{ flex: isStacked ? "3 1 0" : 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", background: bgPrimary }}>
           <SectionTitle
             right={
               <span style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0, justifyContent: "flex-end" }}>
@@ -299,11 +280,11 @@ export function InstalledView(props: InstalledProps): unknown {
             启动参数
           </SectionTitle>
           {selected ? (
-            <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px 10px 4px", display: "flex", flexDirection: "column", gap: 4 }} className={SCROLL_LIST_CLASS}>
+            <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px 10px 4px", display: "flex", flexDirection: "column", gap: 4 }} >
               <ParamsForm settings={settings} folder={selected} onChange={updateParams} />
             </div>
           ) : (
-            <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px 10px", color: textMuted, lineHeight: 1.6 }} className={SCROLL_LIST_CLASS}>
+            <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px 10px", color: textMuted, lineHeight: 1.6 }} >
               在左侧点选一个模型文件夹，即可在此设置它的量化文件、视觉投影、GPU 层数（-ngl）、上下文（--ctx-size）与附加参数。
               <div style={{ marginTop: 8 }}>参数按模型文件夹保存：换模型即带出各自的设置；设好后点顶部「启动」拉起服务。</div>
             </div>

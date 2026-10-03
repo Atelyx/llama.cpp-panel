@@ -15,7 +15,7 @@ import { LibraryView } from "./views/Library";
 import { InstalledView } from "./views/Installed";
 import { LogsView } from "./views/Logs";
 import { SettingsView } from "./views/Settings";
-import { PANEL_CSS, bgSecondary, border, textMuted, FONT_SM } from "./views/ui";
+import { PANEL_CSS, bgPrimary, textMuted, fontUi } from "./views/ui";
 
 /** 与清单里的 name 一致。 */
 const PLUGIN_ID = "com.atelyx.llama.cpp-panel";
@@ -87,7 +87,8 @@ export default function apply(pluginCtx: AtelyxCtx): void {
 
   /**
    * 面板外壳：铺满可用空间（显式 width 防宿主包装层缩成内容宽）。共用的样式表也挂在这里——
-   * 它只在该页签挂载时生效，而滚动条与悬停底色是每个页签都要的，故放在共同外壳上。
+   * 它只在该页签挂载时生效，而悬停底色与聚焦环是每个页签都要的，故放在共同外壳上。
+   * 面板边框与底色由宿主容器给，插件不自绘（见宿主插件样式契约）。
    */
   function PanelShell(props: { children: unknown }): unknown {
     return (
@@ -97,9 +98,8 @@ export default function apply(pluginCtx: AtelyxCtx): void {
           height: "100%",
           display: "flex",
           minHeight: 0,
-          border: `1px solid ${border}`,
           boxSizing: "border-box",
-          background: bgSecondary,
+          background: bgPrimary,
         }}
       >
         <style>{PANEL_CSS}</style>
@@ -110,7 +110,7 @@ export default function apply(pluginCtx: AtelyxCtx): void {
 
   function InitPlaceholder(): unknown {
     return (
-      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: textMuted, fontSize: FONT_SM }}>
+      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: textMuted, fontSize: fontUi }}>
         正在初始化…
       </div>
     );

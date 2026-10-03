@@ -26,7 +26,7 @@ export interface RepoDetail {
   summary: ModelSummary;
   /** 仅 `.gguf`，按体积升序（小的量化在前，便于按显存挑）。 */
   files: RepoFile[];
-  /** 模型卡简介（已剥 Markdown 并截断；空串 = 没有可展示的简介）。 */
+  /** 模型卡 README 原文（front matter 已去；空串 = 没有可展示的简介），详情页经宿主 markdown 内核渲染。 */
   readme: string;
   /** 是否为门控模型：需要授权才能下载，只能到浏览器登录后手动下载。 */
   gated: boolean;

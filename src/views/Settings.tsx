@@ -16,7 +16,7 @@ import {
   TextInput,
   bgSecondary,
   textPrimary,
-  FONT_SM,
+  fontUi,
 } from "./ui";
 
 interface SettingsProps {
@@ -80,7 +80,7 @@ export function SettingsView(props: SettingsProps): unknown {
         minWidth: 0,
         background: bgSecondary,
         color: textPrimary,
-        fontSize: FONT_SM,
+        fontSize: fontUi,
         boxSizing: "border-box",
       }}
     >

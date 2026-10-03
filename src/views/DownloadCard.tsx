@@ -1,7 +1,7 @@
 /** 下载任务卡片：状态、进度条、速度与暂停/继续/收起。进度与速度由快照的字节数变化推算，非推送。 */
 import React from "react";
 import { formatSize, type DownloadTask } from "../host/types";
-import { Button, accent, border, textMuted } from "./ui";
+import { Button, Chip, ProgressBar, fontCaption, textMuted } from "./ui";
 
 /** 进度百分比（总量未知时返回 null）。 */
 function percentOf(bytes: number, total: number | null): number | null {
@@ -15,6 +15,15 @@ function statusLabel(status: DownloadTask["status"]): string {
   if (status === "done") return "已完成";
   if (status === "error") return "下载失败";
   return "待下载";
+}
+
+/** 状态徽标 tone：下载中=强调、暂停=警告、失败=危险、完成=成功。 */
+function statusTone(status: DownloadTask["status"]): "accent" | "warn" | "danger" | "ok" {
+  if (status === "downloading") return "accent";
+  if (status === "paused") return "warn";
+  if (status === "error") return "danger";
+  if (status === "done") return "ok";
+  return "accent";
 }
 
 /** 进度文案：已下/总量 + 百分比 + 速度。 */
@@ -65,38 +74,38 @@ export function DownloadCard(props: {
   return (
     <>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={task.target}>
-          {`${statusLabel(task.status)} · ${task.file}`}
+        <Chip tone={statusTone(task.status)}>{statusLabel(task.status)}</Chip>
+        <span
+          title={task.target}
+          style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: fontCaption }}
+        >
+          {task.file}
         </span>
         {task.status === "downloading" ? (
-          <Button tone="danger" onClick={props.onCancel} title="结束下载进程，已下载部分保留可续传">
+          <Button size="sm" tone="danger" onClick={props.onCancel} title="结束下载进程，已下载部分保留可续传">
             暂停
           </Button>
         ) : null}
         {isPaused || task.status === "error" ? (
-          <Button primary onClick={props.onResume} title="从已下载的部分继续">
+          <Button size="sm" primary onClick={props.onResume} title="从已下载的部分继续">
             继续
           </Button>
         ) : null}
         {/* 暂停时同时给「继续」与「放弃」两个互斥动作，不再叠一个等价的「收起」 */}
         {task.status === "done" || task.status === "error" ? (
-          <Button onClick={props.onDismiss} title="收起这张卡片">
+          <Button size="sm" onClick={props.onDismiss} title="收起这张卡片">
             收起
           </Button>
         ) : null}
         {isPaused ? (
-          <Button tone="danger" onClick={props.onDismiss} title="收起卡片；已下载的临时文件留在模型目录，可再次下载续传">
+          <Button size="sm" tone="danger" onClick={props.onDismiss} title="收起卡片；已下载的临时文件留在模型目录，可再次下载续传">
             放弃
           </Button>
         ) : null}
       </div>
       {/* 总量未知时不画进度条：定死在 0% 会误导，下方的字节数文本已能反映推进 */}
-      {(task.status === "downloading" || isPaused) && pct !== null ? (
-        <div style={{ height: 6, borderRadius: 3, background: border, overflow: "hidden" }}>
-          <div style={{ width: `${pct}%`, height: "100%", background: accent, transition: "width 300ms linear" }} />
-        </div>
-      ) : null}
-      <div style={{ color: task.status === "error" ? "#e5534b" : textMuted, fontSize: 11, wordBreak: "break-word" }}>
+      {(task.status === "downloading" || isPaused) && pct !== null ? <ProgressBar value={pct} /> : null}
+      <div style={{ color: task.status === "error" ? "var(--danger)" : textMuted, fontSize: fontCaption, wordBreak: "break-word" }}>
         {task.status === "downloading" ? progressText(task, speed) : task.statusText}
       </div>
     </>

@@ -95,6 +95,10 @@ export interface AtelyxCtx extends Context {
   layout: {
     declareDefaultLayout(spec: PluginDefaultLayoutSpec): () => void;
   };
+  /** Markdown 渲染（宿主编辑器同一内核，恒可用）：输出已清洗 HTML，可直接挂入插件 UI。 */
+  markdown: {
+    renderHtml(markdown: string, options?: { katex?: boolean }): string;
+  };
   notification: {
     notify(input: {
       message: string;

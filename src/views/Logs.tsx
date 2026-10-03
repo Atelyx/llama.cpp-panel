@@ -2,7 +2,7 @@
 import React from "react";
 import type { HostController, HostSnapshot } from "../host/controller";
 import { MAX_LOGS } from "../host/controller";
-import { Button, Notice, SCROLL_LIST_CLASS, SectionTitle, bgSecondary, border, textMuted, FONT_SM } from "./ui";
+import { Button, Notice, SectionTitle, bgSecondary, border, textMuted, fontMicro, fontUi } from "./ui";
 
 const TERM_BG = "#0d1117";
 const TERM_TEXT = "#c9d1d9";
@@ -38,7 +38,7 @@ function LogLine(props: { line: string }): unknown {
           ? TERM_OK
           : TERM_TEXT;
   return (
-    <div style={{ fontFamily: TERM_FONT, fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-word", color, lineHeight: 1.5 }}>
+    <div style={{ fontFamily: TERM_FONT, fontSize: fontMicro, whiteSpace: "pre-wrap", wordBreak: "break-word", color, lineHeight: 1.5 }}>
       {head ? <span style={{ color: TERM_DIM }}>{head[1]}</span> : null}
       <span>{head ? props.line.slice(head[1].length) : props.line}</span>
     </div>
@@ -68,7 +68,7 @@ export function LogsView(props: { host: HostController }): unknown {
   }, [lastLog]);
 
   return (
-    <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden", background: bgSecondary, color: textMuted, fontSize: FONT_SM, boxSizing: "border-box" }}>
+    <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden", background: bgSecondary, color: textMuted, fontSize: fontUi, boxSizing: "border-box" }}>
       <SectionTitle
         right={
           <span style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
@@ -82,7 +82,7 @@ export function LogsView(props: { host: HostController }): unknown {
                   textOverflow: "ellipsis",
                   whiteSpace: "nowrap",
                   fontFamily: TERM_FONT,
-                  fontSize: 11,
+                  fontSize: fontMicro,
                   color: textMuted,
                   textTransform: "none",
                   letterSpacing: 0,
@@ -105,18 +105,18 @@ export function LogsView(props: { host: HostController }): unknown {
       <div
         ref={logRef}
         style={{ flex: 1, minHeight: 0, overflowY: "auto", scrollbarGutter: "stable", padding: "8px 10px 12px", display: "flex", flexDirection: "column", gap: 2, background: TERM_BG }}
-        className={SCROLL_LIST_CLASS}
+        
       >
         {snapshot.logs.length === 0 ? (
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, color: TERM_DIM, fontSize: FONT_SM, lineHeight: 1.6 }}>
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, color: TERM_DIM, fontSize: fontUi, lineHeight: 1.6 }}>
             <div>尚无日志</div>
-            <div style={{ fontSize: 11 }}>启动或操作 llama-server 后，这里会滚出它的输出。</div>
+            <div style={{ fontSize: fontMicro }}>启动或操作 llama-server 后，这里会滚出它的输出。</div>
           </div>
         ) : (
           snapshot.logs.map((line, i) => <LogLine key={i} line={line} />)
         )}
       </div>
-      <div style={{ borderTop: `1px solid ${border}`, padding: "4px 10px", color: textMuted, fontSize: 11 }}>
+      <div style={{ borderTop: `1px solid ${border}`, padding: "4px 10px", color: textMuted, fontSize: fontMicro }}>
         {`只保留最近 ${MAX_LOGS} 行`}
       </div>
     </div>
