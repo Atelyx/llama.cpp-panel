@@ -54,9 +54,8 @@ export function InstalledView(props: InstalledProps): unknown {
   const hostSnapshot: HostSnapshot = React.useSyncExternalStore(host.subscribe, host.getSnapshot);
 
   const online = runtimeSnapshot.channel === "direct";
-  const isExternal = settings.processMode === "external";
-  const canStart = !isExternal && !hostSnapshot.running && !hostSnapshot.starting;
-  const canStop = !isExternal && (hostSnapshot.running || hostSnapshot.starting);
+  const canStart = !hostSnapshot.running && !hostSnapshot.starting;
+  const canStop = hostSnapshot.running || hostSnapshot.starting;
   const status = ((): { tone: "ok" | "warn" | "bad" | "idle"; label: string; title: string } => {
     if (hostSnapshot.starting)
       return { tone: "warn", label: "启动中", title: "进程已拉起，正在等待 llama-server 接口就绪" };
@@ -64,7 +63,6 @@ export function InstalledView(props: InstalledProps): unknown {
     if (hostSnapshot.watch)
       return { tone: "warn", label: "待命中", title: "自动启动待命：检测到外部 API 调用即自动启动服务" };
     if (hostSnapshot.error) return { tone: "bad", label: "启动失败", title: hostSnapshot.error };
-    if (isExternal) return { tone: "idle", label: "未接管", title: "外部模式：进程归你管，只看连接状态" };
     return { tone: "idle", label: "已停止", title: "未运行" };
   })();
 
@@ -133,16 +131,12 @@ export function InstalledView(props: InstalledProps): unknown {
         />
         <StatusDot tone={status.tone} label={status.label} title={status.title} />
         <span style={{ flex: 1 }} />
-        {!isExternal && (
-          <>
-            <Button primary={canStart} disabled={!canStart} onClick={() => void host.start(runtime)} title={canStart ? "启动 llama-server" : "启动中或已在运行"}>
-              <PlayIcon size={12} /> 启动
-            </Button>
-            <Button tone="danger" disabled={!canStop} onClick={() => void host.stop()} title={canStop ? "停止 llama-server" : "没有运行中的进程"}>
-              <SquareIcon size={12} /> 停止
-            </Button>
-          </>
-        )}
+        <Button primary={canStart} disabled={!canStart} onClick={() => void host.start(runtime)} title={canStart ? "启动 llama-server" : "启动中或已在运行"}>
+          <PlayIcon size={12} /> 启动
+        </Button>
+        <Button tone="danger" disabled={!canStop} onClick={() => void host.stop()} title={canStop ? "停止 llama-server" : "没有运行中的进程"}>
+          <SquareIcon size={12} /> 停止
+        </Button>
       </Toolbar>
       <div ref={layoutRef} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: isStacked ? "column" : "row" }}>
         <div

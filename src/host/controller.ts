@@ -114,7 +114,7 @@ export class HostController {
   applySettings(settings: LlamaSettings): void {
     this.settings = settings;
     // 功能开启下的设置变更是用户重新表态：清掉暂缓，让待命按新设置重新裁决
-    if (settings.autoStartOnApiCall && settings.processMode === "managed") {
+    if (settings.autoStartOnApiCall) {
       this.watchPaused = false;
       this.watchPauseNotified = false;
     }
@@ -156,11 +156,10 @@ export class HostController {
     }
   }
 
-  /** 应待命 = 功能开 && 托管模式 && 服务未运行且未在启动 && 未暂缓 && 探测未连接。 */
+  /** 应待命 = 功能开 && 服务未运行且未在启动 && 未暂缓 && 探测未连接。 */
   private watchDesired(): boolean {
     return (
       this.settings.autoStartOnApiCall &&
-      this.settings.processMode === "managed" &&
       !this.handle &&
       !this.snap.starting &&
       !this.watchPaused &&

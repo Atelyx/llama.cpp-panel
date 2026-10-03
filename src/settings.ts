@@ -6,9 +6,6 @@
  */
 import type { AtelyxCtx } from "./ctx";
 
-/** 托管=插件负责启停；外部=只检测，进程归用户管。 */
-export type ProcessMode = "managed" | "external";
-
 export interface LlamaSettings {
   /** llama-server 监听地址（默认本机）。 */
   host: string;
@@ -22,9 +19,7 @@ export interface LlamaSettings {
   modelFile: string;
   /** 视觉投影文件（全路径，可选）；设置后启动时追加 --mmproj。 */
   mmprojFile: string;
-  /** 进程接管方式。 */
-  processMode: ProcessMode;
-  /** 外部调用自动启动（仅托管模式）：服务未运行时插件占位监听服务端口，检测到外部请求即自动启动。 */
+  /** 外部调用自动启动：服务未运行时插件占位监听服务端口，检测到外部请求即自动启动。 */
   autoStartOnApiCall: boolean;
   /** 模型下载用的镜像站 id（见 host/mirrors 的 MIRRORS）。 */
   downloadMirror: string;
@@ -81,7 +76,6 @@ export const DEFAULT_SETTINGS: LlamaSettings = {
   modelsDir: "",
   modelFile: "",
   mmprojFile: "",
-  processMode: "managed",
   autoStartOnApiCall: false,
   downloadMirror: DEFAULT_MIRROR,
   modelParams: {},
@@ -125,7 +119,6 @@ function coerce(raw: unknown): LlamaSettings {
     return typeof value === "string" ? value : fallback;
   };
   const port = source.port;
-  const mode = source.processMode;
   return {
     host: str("host", DEFAULT_SETTINGS.host).trim() || DEFAULT_SETTINGS.host,
     // 非法端口在此挡掉，后面拼地址的地方无需再判
@@ -137,7 +130,6 @@ function coerce(raw: unknown): LlamaSettings {
     modelsDir: str("modelsDir", DEFAULT_SETTINGS.modelsDir).trim(),
     modelFile: str("modelFile", DEFAULT_SETTINGS.modelFile).trim(),
     mmprojFile: str("mmprojFile", DEFAULT_SETTINGS.mmprojFile).trim(),
-    processMode: mode === "external" ? "external" : "managed",
     autoStartOnApiCall: source.autoStartOnApiCall === true,
     downloadMirror: str("downloadMirror", DEFAULT_SETTINGS.downloadMirror).trim() || DEFAULT_MIRROR,
     modelParams: coerceParams(source.modelParams),
