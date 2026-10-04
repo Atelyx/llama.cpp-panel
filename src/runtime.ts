@@ -101,6 +101,9 @@ export class LlamaRuntime {
     this.probing.add(controller);
     try {
       for (const path of PROBE_PATHS) {
+        // abort 只能掐断在途请求，拦不住循环把下一个端点再发出去；
+        // 已中止的探测不得发起任何新请求，否则会打进刚落位的占位监听、自己触发自己
+        if (controller.signal.aborted) break;
         try {
           const res = await fetchWithTimeout(`${base}${path}`, { method: "GET" }, PROBE_TIMEOUT_MS, controller.signal);
           if (res.status >= 200 && res.status < 300) return "direct";
@@ -111,19 +114,21 @@ export class LlamaRuntime {
     } finally {
       this.probing.delete(controller);
     }
-    // 探测中途被挂起（含挂起引发的中止）不给结论：状态以挂起前为准，也不驱动界面变化
-    if (this.suspended) return this.channel;
+    // 被挂起中止的探测不给结论：状态以挂起前为准，也不驱动界面变化
+    if (controller.signal.aborted) return this.channel;
     return "offline";
   }
 }
 
-/** 带超时的 fetch：超时走内部 controller；外部信号（挂起）中止时一并取消，不影响后续端点各自独立计时。 */
+/** 带超时的 fetch：超时走内部 controller；外部信号（挂起）中止时一并取消，不影响后续端点各自独立计时。
+ *  外部信号已中止时直接拒绝：对已中止信号挂 abort 监听不会再触发，不挡住就等于请求照发。 */
 function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
   external?: AbortSignal,
 ): Promise<Response> {
+  if (external?.aborted) return Promise.reject(new DOMException("aborted", "AbortError"));
   return new Promise((resolve, reject) => {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), timeoutMs);
