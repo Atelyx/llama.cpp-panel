@@ -97,8 +97,10 @@ async function fetchReadme(ctx: AtelyxCtx, mirror: MirrorSource, repo: string): 
     if (result.code !== 0) return "";
     return result
       .stdout.replace(/^\uFEFF/, "")
+      // 行尾归一为 LF：正文交给宿主 markdown 内核渲染，表格按 \n 切行、不认 \r
+      .replace(/\r\n?/g, "\n")
       // YAML front matter（许可证、语言等元数据）不是正文，不参与渲染
-      .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+      .replace(/^---\n[\s\S]*?\n---\n?/, "");
   } catch {
     return "";
   }
