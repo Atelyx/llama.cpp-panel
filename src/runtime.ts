@@ -2,7 +2,7 @@
  * 连接状态中心：HTTP 探测本机 llama-server，判定 direct/offline。
  * 只关心「服务在不在」，故无长连接；轮询保持状态新鲜，探测失败一律落 offline 而不抛。
  * 宿主每窗口各装配一份插件实例，探测前须先握手：端口被自家占位监听（兄弟实例待命）持有时
- * 不打正式端点——任何正式请求都会把自己触发成启动，握手契约见 host/watchScripts。
+ * 不打正式端点——占位监听对非触发请求只会关闭连接，打了也只是白费流量的噪音。
  */
 import { baseUrl, type LlamaSettings } from "./settings";
 
@@ -120,15 +120,14 @@ export class LlamaRuntime {
   private async probeOnce(): Promise<Channel> {
     if (this.suspended) return this.channel;
     const base = baseUrl(this.settings);
-    // 握手先行：自家占位监听持有端口时（兄弟实例待命），任何正式端点请求都会把自己触发成启动。
-    // 握手本身被占位监听白名单放行，对兄弟实例无害
+    // 握手先行：自家占位监听持有端口时（兄弟实例待命），正式端点探测只会吃到关闭的连接，纯噪音
     if (await watchPingOk(base)) return this.channel;
     const controller = new AbortController();
     this.probing.add(controller);
     try {
       for (const path of PROBE_PATHS) {
         // abort 只能掐断在途请求，拦不住循环把下一个端点再发出去；
-        // 已中止的探测不得发起任何新请求，否则会打进刚落位的占位监听、自己触发自己
+        // 已中止的探测不得发起任何新请求：挂起即视为待命期间，对占位端口发请求纯属噪音
         if (controller.signal.aborted) break;
         try {
           const res = await fetchWithTimeout(`${base}${path}`, { method: "GET" }, PROBE_TIMEOUT_MS, controller.signal);

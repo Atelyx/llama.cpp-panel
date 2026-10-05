@@ -129,7 +129,7 @@ export class HostController {
   evaluateWatcher(): void {
     if (this.disposed) return;
     if (this.watchDesired()) {
-      // 先挂起探测再起占位进程：否则探测会打进占位监听、把自己触发成启动
+      // 先挂起探测再起占位进程：待命期间端口不对外服务，探测只会白跑
       this.runtime.setSuspended(true);
       void this.getPlatform()
         .then((platform) => this.watcher.arm(platform, this.settings, this.watchHooks))
@@ -149,7 +149,7 @@ export class HostController {
         })
         .catch((err: unknown) => void this.classifyArmFailure(describe(err)));
     } else {
-      // 先杀占位进程再恢复探测，顺序反了恢复的首个探测会把自己触发成启动
+      // 先杀占位进程再恢复探测：端口一空出来，恢复的首个探测结论才真实
       void this.watcher.disarm().then((wasArmed) => {
         this.runtime.setSuspended(false);
         if (wasArmed) {

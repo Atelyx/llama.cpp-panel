@@ -3,10 +3,11 @@
  * 内容保持纯 ASCII：PowerShell 5.1 对无 BOM 文件按 ANSI 读，非 ASCII 注释会变乱码。
  *
  * 触发契约（watcher 据此编排）：
- * - 待命：占住端口循环 accept；无数据连接（端口扫描）、首页 GET / 与插件握手端点
- *   （GET /__llama-panel-watch-ping，回约定标记供 runtime 识别自家占位监听）不触发；
- * - 触发：收到请求即向 stdout 打印一行「请求首行 + " | ua=" + User-Agent」（watcher 的启动信号，
- *   后缀供日志定位调用方），随即让出端口并保持该连接，
+ * - 待命：占住端口循环 accept；GET 类请求（浏览器/各种探测/端口扫描）与无数据连接一律视为噪音，
+ *   不触发；插件握手端点（GET /__llama-panel-watch-ping）额外回约定标记，供 runtime 识别自家占位监听；
+ * - 触发：仅真实 API 调用（POST/PUT/PATCH/DELETE 与 CORS 预检 OPTIONS）触发：向 stdout 打印一行
+ *   「请求首行 + " | ua=" + User-Agent」（watcher 的启动信号，后缀供日志定位调用方），
+ *   随即让出端口并保持该连接，
  *   等 llama-server 就绪（/health 不再返回 503，最长 3 分钟）后转发请求、双向回传，完成后自灭；
  * - 触发路径退出码恒为 0（watcher 以 stdout 首行为准），其余退出 = 待命异常。
  */
@@ -54,7 +55,6 @@ try {
       $path = ""
       if ($parts.Length -gt 0) { $method = $parts[0] }
       if ($parts.Length -gt 1) { $path = ($parts[1] -split '\?')[0] }
-      if ($method -ieq "GET" -and $path -eq "/") { continue }
       if ($method -ieq "GET" -and $path -eq "${WATCH_PING_PATH}") {
         $crlf = "" + [char]13 + [char]10
         $body = "${WATCH_PING_MARKER}"
@@ -64,6 +64,8 @@ try {
         $cs.Write($resp, 0, $resp.Length)
         continue
       }
+      if ($method -ieq "GET") { continue }
+      if ($method -notmatch '^(POST|PUT|PATCH|DELETE|OPTIONS)$') { continue }
       $ua = ""
       foreach ($h in ($request -split '\r?\n')) {
         if ($h -match '^\s*User-Agent:\s*(.+)$') { $ua = $Matches[1].Trim(); break }
@@ -162,13 +164,15 @@ while True:
         parts = first.split()
         method = parts[0].upper() if parts else ""
         path = parts[1].split("?", 1)[0] if len(parts) > 1 else ""
-        if method == "GET" and path == "/":
-            continue
         if method == "GET" and path == "${WATCH_PING_PATH}":
             body = "${WATCH_PING_MARKER}".encode()
             head = ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n"
                     "Content-Length: %d\r\n\r\n" % len(body)).encode()
             conn.sendall(head + body)
+            continue
+        if method == "GET":
+            continue
+        if method not in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
             continue
         ua = ""
         for hl in data.split(b"\r\n"):
@@ -282,7 +286,6 @@ while (1) {
   my @parts = split /\s+/, $first;
   my $method = uc($parts[0] // "");
   (my $path = $parts[1] // "") =~ s/\?.*//;
-  if ($method eq "GET" && $path eq "/") { close $conn; next; }
   if ($method eq "GET" && $path eq "${WATCH_PING_PATH}") {
     my $body = "${WATCH_PING_MARKER}";
     print $conn "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n"
@@ -290,6 +293,8 @@ while (1) {
     close $conn;
     next;
   }
+  if ($method eq "GET") { close $conn; next; }
+  unless ($method =~ /^(POST|PUT|PATCH|DELETE|OPTIONS)$/) { close $conn; next; }
   my $ua = "";
   for my $hl (split /\r?\n/, $data) {
     if ($hl =~ /^\s*user-agent:\s*(.+?)\s*$/i) { $ua = $1; last; }
