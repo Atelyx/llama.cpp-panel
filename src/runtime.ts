@@ -1,6 +1,8 @@
 /**
  * 连接状态中心：HTTP 探测本机 llama-server，判定 direct/offline。
  * 只关心「服务在不在」，故无长连接；轮询保持状态新鲜，探测失败一律落 offline 而不抛。
+ * 宿主每窗口各装配一份插件实例，探测前须先握手：端口被自家占位监听（兄弟实例待命）持有时
+ * 不打正式端点——任何正式请求都会把自己触发成启动，握手契约见 host/watchScripts。
  */
 import { baseUrl, type LlamaSettings } from "./settings";
 
@@ -10,14 +12,32 @@ export interface RuntimeSnapshot {
   channel: Channel;
 }
 
+/** 握手端点与标记：占位监听对该端点白名单放行并回标记（响应须带 CORS 头，webview fetch 才读得到）。 */
+export const WATCH_PING_PATH = "/__llama-panel-watch-ping";
+export const WATCH_PING_MARKER = "llama-panel-watch-ok";
+
 /** 探测端点按版本兼容顺序：/api/models → /api/version → /（Web UI）。 */
 const PROBE_PATHS = ["/api/models", "/api/version", "/"];
 
 /** 单次探测超时：本机服务，慢于此即视作不可用。 */
 const PROBE_TIMEOUT_MS = 3000;
 
+/** 握手超时：占位监听应答是毫秒级纯内存操作，慢即视为不是自家监听。 */
+const PING_TIMEOUT_MS = 1500;
+
 /** 插件活跃期轮询间隔：状态新鲜度与本机服务之间取平衡。 */
 const POLL_INTERVAL_MS = 5000;
+
+/** 握手：端口持有者应答约定标记 = 自家占位监听在待命；其余（未监听、真服务的 404）一律 false。 */
+async function watchPingOk(base: string): Promise<boolean> {
+  try {
+    const res = await fetchWithTimeout(`${base}${WATCH_PING_PATH}`, { method: "GET" }, PING_TIMEOUT_MS);
+    return res.status === 200 && (await res.text()) === WATCH_PING_MARKER;
+  } catch {
+    // 连接拒绝/超时/CORS 拒读都算「不是自家监听」
+    return false;
+  }
+}
 
 export class LlamaRuntime {
   private settings: LlamaSettings;
@@ -49,6 +69,9 @@ export class LlamaRuntime {
     this.settings = settings;
     if (!this.suspended) void this.probeOnce();
   }
+
+  /** 端口持有者是否为自家占位监听（兄弟实例待命中）。待命裁决抢端口失败后据此分类，见 controller。 */
+  isSiblingWatchHeld = async (): Promise<boolean> => watchPingOk(baseUrl(this.settings));
 
   /** 挂起/恢复：挂起即停轮询、探测短路；恢复时重启轮询并立即探测。 */
   setSuspended(suspended: boolean): void {
@@ -97,6 +120,9 @@ export class LlamaRuntime {
   private async probeOnce(): Promise<Channel> {
     if (this.suspended) return this.channel;
     const base = baseUrl(this.settings);
+    // 握手先行：自家占位监听持有端口时（兄弟实例待命），任何正式端点请求都会把自己触发成启动。
+    // 握手本身被占位监听白名单放行，对兄弟实例无害
+    if (await watchPingOk(base)) return this.channel;
     const controller = new AbortController();
     this.probing.add(controller);
     try {

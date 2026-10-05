@@ -10,8 +10,8 @@ import { shellQuote, type Platform } from "./process";
 import { PL_SCRIPT, PS_SCRIPT, PY_SCRIPT } from "./watchScripts";
 
 export interface WatchHooks {
-  /** 外部 API 调用触发；requestLine = 触发请求的首行，供日志指明是什么调用。 */
-  onTrigger(requestLine: string): void;
+  /** 外部 API 调用触发；requestLine = 触发请求的首行，userAgent = 调用方自报身份（日志定位用）。 */
+  onTrigger(requestLine: string, userAgent: string): void;
   /** 待命异常结束（绑定失败、解释器缺失等），带可读原因。 */
   onBroken(reason: string): void;
 }
@@ -21,6 +21,9 @@ export interface ArmOutcome {
   ok: boolean;
   error?: string;
 }
+
+/** watchScripts 在请求行后拼接的调用方标识前缀。 */
+const UA_SUFFIX = " | ua=";
 
 export class ApiCallWatcher {
   private readonly ctx: AtelyxCtx;
@@ -33,7 +36,7 @@ export class ApiCallWatcher {
   private queue: Promise<unknown> = Promise.resolve();
   /** 占位进程的最后一段错误输出：绑定失败等原因都在末尾。 */
   private stderrTail = "";
-  /** 触发请求的首行：占位进程经 stdout 带回，日志与通知用它指明来源。 */
+  /** 触发请求的首行：占位进程经 stdout 带回（不含 ua 后缀），日志与通知用它指明来源。 */
   private triggerLine = "";
   private scriptDir: string | null = null;
   private readonly writtenScripts = new Set<string>();
@@ -83,20 +86,23 @@ export class ApiCallWatcher {
       broken = reason;
       hooks.onBroken(reason);
     };
-    const trigger = (requestLine: string): void => {
+    const trigger = (requestLine: string, userAgent: string): void => {
       if (ended) return;
       ended = true;
-      hooks.onTrigger(requestLine);
+      hooks.onTrigger(requestLine, userAgent);
     };
     const raw: ShellStreamHandlers = {
       chunk: ({ stream, data }) => {
         if (stream === "stderr" && data.trim()) this.stderrTail = data.trim();
-        // stdout 首行即触发；触发后占位进程转为转发器自灭，句柄摘除，disarm 不再取消它
+        // stdout 首行即触发；触发后占位进程转为转发器自灭，句柄摘除，disarm 不再取消它。
+        // 首行格式 =「请求行 + " | ua=" + User-Agent」，后缀由 watchScripts 拼接，解析在此收口
         if (stream === "stdout" && !this.triggerLine) {
           const line = data.trim();
           if (line) {
-            this.triggerLine = line.split("\n")[0].trim();
-            trigger(this.triggerLine);
+            const first = line.split("\n")[0].trim();
+            const sep = first.lastIndexOf(UA_SUFFIX);
+            this.triggerLine = sep >= 0 ? first.slice(0, sep).trim() : first;
+            trigger(this.triggerLine, sep >= 0 ? first.slice(sep + UA_SUFFIX.length).trim() : "");
             this.handle = null;
           }
         }
@@ -104,7 +110,7 @@ export class ApiCallWatcher {
       end: ({ code }) => {
         if (gen !== this.gen || ended) return;
         // 兜底：没有 stdout 首行的正常退出仍按触发处理
-        if (code === 0) trigger(this.triggerLine);
+        if (code === 0) trigger(this.triggerLine, "");
         else fail(`待命进程异常退出（退出码 ${code ?? "未知"}）${clip(this.stderrTail)}`);
       },
       error: (message) => {

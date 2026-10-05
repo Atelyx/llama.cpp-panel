@@ -38,6 +38,8 @@ export const MAX_LOGS = 300;
 const READY_TIMEOUT_MS = 180000;
 /** 错误输出可能极长，进通知与快照前截断。 */
 const ERROR_DETAIL_MAX = 200;
+/** 跟随模式的握手间隔：兄弟实例的占位监听对该请求白名单放行，频一点也无妨。 */
+const FOLLOWER_TICK_MS = 5000;
 
 const EMPTY: HostSnapshot = {
   running: false,
@@ -74,6 +76,8 @@ export class HostController {
   private watchPaused = false;
   /** 每轮暂缓最多提示一次；恢复待命能力后重新允许提示。 */
   private watchPauseNotified = false;
+  /** 跟随模式定时器：端口被兄弟实例的占位监听持有时保持探测挂起，仅定时握手，非空即跟随中。 */
+  private followerTimer: number | null = null;
   private disposed = false;
 
   constructor(ctx: AtelyxCtx, settings: LlamaSettings, runtime: LlamaRuntime) {
@@ -87,15 +91,15 @@ export class HostController {
 
   /** 触发/异常回调收口：先收敛快照状态，再交给各自流程。 */
   private readonly watchHooks: WatchHooks = {
-    onTrigger: (requestLine) => {
+    onTrigger: (requestLine, userAgent) => {
       if (this.disposed) return;
       if (this.snap.watch) this.emit({ watch: false });
-      void this.autoStart(requestLine);
+      void this.autoStart(requestLine, userAgent);
     },
     onBroken: (reason) => {
       if (this.disposed) return;
       if (this.snap.watch) this.emit({ watch: false });
-      this.pauseAutoStart(reason);
+      void this.classifyArmFailure(reason);
     },
   };
 
@@ -131,7 +135,7 @@ export class HostController {
         .then((platform) => this.watcher.arm(platform, this.settings, this.watchHooks))
         .then((result) => {
           if (!result.ok) {
-            this.pauseAutoStart(result.error ?? "待命进程未能启动");
+            void this.classifyArmFailure(result.error ?? "待命进程未能启动");
             return;
           }
           if (this.disposed || !this.watcher.isArmed() || this.snap.watch) return;
@@ -141,16 +145,16 @@ export class HostController {
             return;
           }
           this.emit({ watch: true });
-          this.log(`自动启动待命中：监听 ${this.settings.host}:${this.settings.port}，外部调用将自动启动`);
+          this.logStatus(`自动启动待命中：监听 ${this.settings.host}:${this.settings.port}，外部调用将自动启动`);
         })
-        .catch((err: unknown) => this.pauseAutoStart(describe(err)));
+        .catch((err: unknown) => void this.classifyArmFailure(describe(err)));
     } else {
       // 先杀占位进程再恢复探测，顺序反了恢复的首个探测会把自己触发成启动
       void this.watcher.disarm().then((wasArmed) => {
         this.runtime.setSuspended(false);
         if (wasArmed) {
           this.emit({ watch: false });
-          this.log("已退出自动启动待命");
+          this.logStatus("已退出自动启动待命");
         }
       });
     }
@@ -173,7 +177,7 @@ export class HostController {
     this.watchPaused = true;
     this.runtime.setSuspended(false);
     if (this.snap.watch) this.emit({ watch: false });
-    this.log(`自动启动已暂缓：${reason}`);
+    this.logStatus(`自动启动已暂缓：${reason}`);
     if (this.watchPauseNotified) return;
     this.watchPauseNotified = true;
     try {
@@ -187,10 +191,56 @@ export class HostController {
     }
   }
 
-  /** 外部调用触发：提示后复用普通启动流程。 */
-  private async autoStart(requestLine: string): Promise<void> {
+  /** 抢端口/待命失败的分类：对手是自家兄弟实例的占位监听 → 跟随；否则按失败暂缓。
+   *  分类只能用握手 ping——正式端点探测若打中兄弟占位监听，会把它触发成启动。 */
+  private async classifyArmFailure(reason: string): Promise<void> {
+    if (this.disposed) return;
+    if (await this.runtime.isSiblingWatchHeld()) {
+      this.enterFollower();
+      return;
+    }
+    this.pauseAutoStart(reason);
+  }
+
+  /** 跟随模式：保持探测挂起（绝不发正式请求，防止触发兄弟实例），定时握手等兄弟退场后接管。
+   *  多窗口各自装配一份插件实例是宿主常态，跟随即静默共存，不弹通知。 */
+  private enterFollower(): void {
+    if (this.followerTimer !== null) return;
+    this.logStatus("端口由其他窗口的待命持有，本窗口跟随");
+    this.followerTimer = window.setInterval(() => void this.followerTick(), FOLLOWER_TICK_MS);
+  }
+
+  private async followerTick(): Promise<void> {
+    if (this.disposed) {
+      // 卸载可能发生在握手 await 期间、晚于 dispose 的清理：这里兜底摘掉定时器
+      this.exitFollower();
+      return;
+    }
+    if (this.followerTimer === null) return;
+    if (!this.watchDesired()) {
+      // 功能已关/服务在跑/手动启动等：跟随的前提消失，回归常规状态
+      this.exitFollower();
+      this.runtime.setSuspended(false);
+      return;
+    }
+    if (await this.runtime.isSiblingWatchHeld()) return;
+    // 兄弟占位监听已消失：端口空出或真服务上线，恢复探测后重新裁决
+    this.exitFollower();
+    this.runtime.setSuspended(false);
+    this.evaluateWatcher();
+  }
+
+  private exitFollower(): void {
+    if (this.followerTimer === null) return;
+    window.clearInterval(this.followerTimer);
+    this.followerTimer = null;
+  }
+
+  /** 外部调用触发：提示后复用普通启动流程。调用方 UA 只落日志（通知保持一行说清）。 */
+  private async autoStart(requestLine: string, userAgent: string): Promise<void> {
     const detail = requestLine ? `（${requestLine}）` : "";
-    this.log(`检测到外部 API 调用${detail}，正在启动 llama-server…`);
+    this.logStatus(`检测到外部 API 调用${detail}，正在启动 llama-server…`);
+    if (userAgent) this.logStatus(`调用方标识（User-Agent）：${userAgent}`);
     try {
       this.ctx.notification.notify({
         level: "info",
@@ -219,6 +269,13 @@ export class HostController {
     });
   }
 
+  /** 插件自身状态行带时刻前缀：进程输出自带 llama-server 时间戳，插件行没有，排障对时需要。 */
+  private logStatus(line: string, stream: "stdout" | "stderr" = "stdout"): void {
+    const now = new Date();
+    const pad = (n: number): string => String(n).padStart(2, "0");
+    this.log(`[${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}] ${line}`, stream);
+  }
+
   clearLogs(): void {
     this.emit({ logs: [] });
   }
@@ -238,7 +295,7 @@ export class HostController {
       // 加载模型会耗时数十秒，定期留个心跳，让用户看到还在等
       if (elapsed - lastHeartbeat >= 5000) {
         lastHeartbeat = elapsed;
-        this.log(`等待服务就绪…（${Math.round(elapsed / 1000)}s）`);
+        this.logStatus(`等待服务就绪…（${Math.round(elapsed / 1000)}s）`);
       }
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }
@@ -328,7 +385,7 @@ export class HostController {
               : "";
             this.died = `进程已退出（退出码 ${code ?? "未知"}）${detail}`;
             this.emit({ running: false });
-            this.log(`进程已退出（退出码 ${code ?? "未知"}）`, "stderr");
+            this.logStatus(`进程已退出（退出码 ${code ?? "未知"}）`, "stderr");
             // 进程退出后重新裁决，待命自动恢复
             this.evaluateWatcher();
           },
@@ -373,7 +430,7 @@ export class HostController {
     }
     try {
       await handle.cancel();
-      this.log("已结束 llama-server 进程");
+      this.logStatus("已结束 llama-server 进程");
     } catch (err) {
       this.emit({ error: describe(err) });
     } finally {
@@ -382,9 +439,10 @@ export class HostController {
     }
   }
 
-  /** 插件停用/卸载：解除待命并忽略后续触发；进程收尾归宿主。 */
+  /** 插件停用/卸载：解除待命与跟随并忽略后续触发；进程收尾归宿主。 */
   dispose(): void {
     this.disposed = true;
+    this.exitFollower();
     void this.watcher.disarm();
   }
 }

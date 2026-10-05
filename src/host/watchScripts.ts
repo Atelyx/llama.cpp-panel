@@ -3,11 +3,14 @@
  * 内容保持纯 ASCII：PowerShell 5.1 对无 BOM 文件按 ANSI 读，非 ASCII 注释会变乱码。
  *
  * 触发契约（watcher 据此编排）：
- * - 待命：占住端口循环 accept；无数据连接（端口扫描）与首页 GET / 不触发；
- * - 触发：收到请求即向 stdout 打印请求首行（watcher 的启动信号），随即让出端口并保持该连接，
+ * - 待命：占住端口循环 accept；无数据连接（端口扫描）、首页 GET / 与插件握手端点
+ *   （GET /__llama-panel-watch-ping，回约定标记供 runtime 识别自家占位监听）不触发；
+ * - 触发：收到请求即向 stdout 打印一行「请求首行 + " | ua=" + User-Agent」（watcher 的启动信号，
+ *   后缀供日志定位调用方），随即让出端口并保持该连接，
  *   等 llama-server 就绪（/health 不再返回 503，最长 3 分钟）后转发请求、双向回传，完成后自灭；
  * - 触发路径退出码恒为 0（watcher 以 stdout 首行为准），其余退出 = 待命异常。
  */
+import { WATCH_PING_MARKER, WATCH_PING_PATH } from "../runtime";
 
 const PS_SCRIPT = String.raw`param(
   [string]$BindHost = "127.0.0.1",
@@ -52,7 +55,20 @@ try {
       if ($parts.Length -gt 0) { $method = $parts[0] }
       if ($parts.Length -gt 1) { $path = ($parts[1] -split '\?')[0] }
       if ($method -ieq "GET" -and $path -eq "/") { continue }
-      Write-Output $firstLine
+      if ($method -ieq "GET" -and $path -eq "${WATCH_PING_PATH}") {
+        $crlf = "" + [char]13 + [char]10
+        $body = "${WATCH_PING_MARKER}"
+        $resp = [System.Text.Encoding]::ASCII.GetBytes(
+          "HTTP/1.1 200 OK" + $crlf + "Content-Type: text/plain" + $crlf +
+          "Access-Control-Allow-Origin: *" + $crlf + "Content-Length: " + $body.Length + $crlf + $crlf + $body)
+        $cs.Write($resp, 0, $resp.Length)
+        continue
+      }
+      $ua = ""
+      foreach ($h in ($request -split '\r?\n')) {
+        if ($h -match '^\s*User-Agent:\s*(.+)$') { $ua = $Matches[1].Trim(); break }
+      }
+      Write-Output ($firstLine + " | ua=" + $ua)
       $listener.Stop()
 
       # hold the connection and keep buffering the client request while waiting
@@ -148,7 +164,18 @@ while True:
         path = parts[1].split("?", 1)[0] if len(parts) > 1 else ""
         if method == "GET" and path == "/":
             continue
-        print(first, flush=True)
+        if method == "GET" and path == "${WATCH_PING_PATH}":
+            body = "${WATCH_PING_MARKER}".encode()
+            head = ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n"
+                    "Content-Length: %d\r\n\r\n" % len(body)).encode()
+            conn.sendall(head + body)
+            continue
+        ua = ""
+        for hl in data.split(b"\r\n"):
+            if hl[:11].lower() == b"user-agent:":
+                ua = hl[11:].strip().decode("latin-1", "replace")
+                break
+        print(first + " | ua=" + ua, flush=True)
         srv.close()  # yield the port; keep the client for forwarding
         buf = bytearray(data)
         conn.settimeout(0.25)
@@ -256,7 +283,18 @@ while (1) {
   my $method = uc($parts[0] // "");
   (my $path = $parts[1] // "") =~ s/\?.*//;
   if ($method eq "GET" && $path eq "/") { close $conn; next; }
-  print "$first\n";
+  if ($method eq "GET" && $path eq "${WATCH_PING_PATH}") {
+    my $body = "${WATCH_PING_MARKER}";
+    print $conn "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n"
+      . "Content-Length: " . length($body) . "\r\n\r\n" . $body;
+    close $conn;
+    next;
+  }
+  my $ua = "";
+  for my $hl (split /\r?\n/, $data) {
+    if ($hl =~ /^\s*user-agent:\s*(.+?)\s*$/i) { $ua = $1; last; }
+  }
+  print "$first | ua=$ua\n";
   close $srv;    # yield the port; keep the client for forwarding
   undef $srv;
   my $buf = $data;
