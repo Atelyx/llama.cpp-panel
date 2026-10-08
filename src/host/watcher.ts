@@ -2,17 +2,20 @@
  * 自动启动待命：服务未运行时用占位进程监听服务端口——llama-server 不在时外部只会收到连接拒绝，
  * 占住端口是看见外部调用的唯一途径。触发判定由占位进程过滤（仅真实 API 调用，见 watchScripts），
  * 待命期间本插件对端口的探测挂起：占位进程不对外服务，探测只会得到关闭的连接，纯无谓流量。
- * 触发契约见 watchScripts：stdout 首行到达即触发；触发后占位进程转为请求转发器自灭，
+ * 触发契约见 watchScripts：stdout 不带前缀的首行到达即触发；带 NOISE_PREFIX 前缀的行是待命期间
+ * 收到的非触发请求，经 onNoise 落日志；触发后占位进程转为请求转发器自灭，
  * 句柄就此摘除，disarm 不再取消它；触发前的异常退出 = 待命异常。
  */
-import type { AtelyxCtx, ShellProcessHandle, ShellStreamHandlers } from "../ctx";
+import type { AtelyxCtx, ProcessHandle, ProcessStreamHandlers } from "../ctx";
 import type { LlamaSettings } from "../settings";
 import { shellQuote, type Platform } from "./process";
-import { PL_SCRIPT, PS_SCRIPT, PY_SCRIPT } from "./watchScripts";
+import { NOISE_PREFIX, PL_SCRIPT, PS_SCRIPT, PY_SCRIPT } from "./watchScripts";
 
 export interface WatchHooks {
   /** 外部 API 调用触发；requestLine = 触发请求的首行，userAgent = 调用方自报身份（日志定位用）。 */
   onTrigger(requestLine: string, userAgent: string): void;
+  /** 待命期间收到的非触发请求（噪音）：首行已去前缀，仅落日志，不触发启动。 */
+  onNoise(line: string): void;
   /** 待命异常结束（绑定失败、解释器缺失等），带可读原因。 */
   onBroken(reason: string): void;
 }
@@ -28,7 +31,7 @@ const UA_SUFFIX = " | ua=";
 
 export class ApiCallWatcher {
   private readonly ctx: AtelyxCtx;
-  private handle: ShellProcessHandle | null = null;
+  private handle: ProcessHandle | null = null;
   private host = "";
   private port = 0;
   /** 每次 arm/disarm 自增；占位进程的退出事件按代过滤，上一代的迟到事件直接忽略。 */
@@ -92,20 +95,29 @@ export class ApiCallWatcher {
       ended = true;
       hooks.onTrigger(requestLine, userAgent);
     };
-    const raw: ShellStreamHandlers = {
+    const raw: ProcessStreamHandlers = {
       chunk: ({ stream, data }) => {
+        if (gen !== this.gen) return;
         if (stream === "stderr" && data.trim()) this.stderrTail = data.trim();
-        // stdout 首行即触发；触发后占位进程转为转发器自灭，句柄摘除，disarm 不再取消它。
-        // 首行格式 =「请求行 + " | ua=" + User-Agent」，后缀由 watchScripts 拼接，解析在此收口
-        if (stream === "stdout" && !this.triggerLine) {
-          const line = data.trim();
-          if (line) {
-            const first = line.split("\n")[0].trim();
-            const sep = first.lastIndexOf(UA_SUFFIX);
-            this.triggerLine = sep >= 0 ? first.slice(0, sep).trim() : first;
-            trigger(this.triggerLine, sep >= 0 ? first.slice(sep + UA_SUFFIX.length).trim() : "");
-            this.handle = null;
+        if (stream !== "stdout" || this.triggerLine) return;
+        // 逐行消费：噪音行与触发行可能合并在同一段输出里；不带前缀的首行即触发，
+        // 格式 =「请求行 + " | ua=" + User-Agent」，后缀由 watchScripts 拼接，解析在此收口。
+        // 只去尾部空白：前缀自带尾随空格，整体 trim 会让空载荷的噪音行（首行为空的垃圾请求）
+        // 判不上前缀而误成触发
+        for (const rawLine of data.split("\n")) {
+          const line = rawLine.trimEnd();
+          if (!line.trim()) continue;
+          if (line.startsWith(NOISE_PREFIX)) {
+            const text = line.slice(NOISE_PREFIX.length).trim();
+            if (text) hooks.onNoise(text);
+            continue;
           }
+          const first = line.trim();
+          const sep = first.lastIndexOf(UA_SUFFIX);
+          this.triggerLine = sep >= 0 ? first.slice(0, sep).trim() : first;
+          trigger(this.triggerLine, sep >= 0 ? first.slice(sep + UA_SUFFIX.length).trim() : "");
+          this.handle = null;
+          break;
         }
       },
       end: ({ code }) => {
@@ -149,7 +161,7 @@ export class ApiCallWatcher {
       };
     }
 
-    const handle = await this.ctx.shell.spawn(spawnOpts, raw);
+    const handle = await this.ctx.process.spawn(spawnOpts, raw);
     // 句柄落地前进程就已退出：绑定失败等立即报错走这条路，不能再把句柄当「在待命」
     if (ended) {
       return broken ? { ok: false, error: broken } : { ok: true };
@@ -183,7 +195,7 @@ export class ApiCallWatcher {
   ): Promise<{ command: string; args: string[] } | null> {
     let interpreter = "";
     for (const candidate of ["python3", "perl"]) {
-      const found = await this.ctx.shell.exec({ command: "sh", args: ["-c", `command -v ${candidate}`] });
+      const found = await this.ctx.process.exec({ command: "sh", args: ["-c", `command -v ${candidate}`] });
       if (found && found.code === 0 && found.stdout.trim()) {
         interpreter = candidate;
         break;

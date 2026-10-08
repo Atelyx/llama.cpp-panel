@@ -2,7 +2,7 @@
  * 进程托管状态中心：启停、就绪判定与日志，独立于 runtime。
  * 进程（本机）与连接（网络）是两条信息：用户自起的服务连接通但不归本插件管，界面要同时呈现。
  */
-import type { AtelyxCtx, ShellProcessHandle } from "../ctx";
+import type { AtelyxCtx, ProcessHandle } from "../ctx";
 import type { LlamaSettings } from "../settings";
 import type { LlamaRuntime } from "../runtime";
 import { ApiCallWatcher, type WatchHooks } from "./watcher";
@@ -61,7 +61,7 @@ export class HostController {
   /** 首次用到时向 Atelyx 问一次并缓存。 */
   private platform: Platform | null = null;
   /** 本插件启动的进程句柄；停止与「是否在运行」都依它判断。 */
-  private handle: ShellProcessHandle | null = null;
+  private handle: ProcessHandle | null = null;
   /** 等待就绪期间进程退出或出错的原因；非空即终止等待，不再空等满超时。 */
   private died = "";
   /** 最后一条非空错误输出：进程没打印可读原因时，它就是最接近现场的信息。 */
@@ -89,12 +89,17 @@ export class HostController {
     runtime.subscribe(() => this.evaluateWatcher());
   }
 
-  /** 触发/异常回调收口：先收敛快照状态，再交给各自流程。 */
+  /** 触发/异常/噪音回调收口：先收敛快照状态，再交给各自流程。 */
   private readonly watchHooks: WatchHooks = {
     onTrigger: (requestLine, userAgent) => {
       if (this.disposed) return;
       if (this.snap.watch) this.emit({ watch: false });
       void this.autoStart(requestLine, userAgent);
+    },
+    onNoise: (line) => {
+      // 裁决排队/收尾窗口里快照可能已退出待命：此刻的噪音行不再属于「待命收到」
+      if (this.disposed || !this.snap.watch) return;
+      this.logStatus(`待命收到请求：${line}`);
     },
     onBroken: (reason) => {
       if (this.disposed) return;
@@ -364,7 +369,8 @@ export class HostController {
       return false;
     }
 
-    this.emit({ error: "", startLine: line, logs: [] });
+    // 日志不清屏：跨多次启动保留现场，只有用户手动清屏才清
+    this.emit({ error: "", startLine: line });
 
     try {
       const handle = await startLlama(

@@ -6,7 +6,7 @@
  * 其格式随平台变、经宿主按行切分会碎。下完才改名 `.gguf`，模型扫描因此看不到半截文件；
  * 取消只结束 curl 进程并保留 `.part`，再开始时用 `-C -` 续传。
  */
-import type { AtelyxCtx, ListDirEntry, ShellProcessHandle } from "../ctx";
+import type { AtelyxCtx, ListDirEntry, ProcessHandle } from "../ctx";
 import { describeCurlExit, spawnCurl } from "./curl";
 import { fetchRemoteInfo } from "./hf";
 import { downloadUrl, mirrorById, parseTarget, uniqueName } from "./mirrors";
@@ -46,7 +46,7 @@ function idleTask(): DownloadTask {
 export class Downloader {
   private readonly ctx: AtelyxCtx;
   private task: DownloadTask = idleTask();
-  private handle: ShellProcessHandle | null = null;
+  private handle: ProcessHandle | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private partPath = "";
   private finalPath = "";

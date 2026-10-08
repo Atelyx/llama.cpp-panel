@@ -3,8 +3,9 @@
  * 内容保持纯 ASCII：PowerShell 5.1 对无 BOM 文件按 ANSI 读，非 ASCII 注释会变乱码。
  *
  * 触发契约（watcher 据此编排）：
- * - 待命：占住端口循环 accept；GET 类请求（浏览器/各种探测/端口扫描）与无数据连接一律视为噪音，
- *   不触发；插件握手端点（GET /__llama-panel-watch-ping）额外回约定标记，供 runtime 识别自家占位监听；
+ * - 待命：占住端口循环 accept；收到的任何请求（含 GET 类探测与插件握手）把首行带「[watch] 」前缀
+ *   打到 stdout 供日志展示，均不触发；插件握手端点（GET /__llama-panel-watch-ping）额外回约定标记，
+ *   供 runtime 识别自家占位监听；
  * - 触发：仅真实 API 调用（POST/PUT/PATCH/DELETE 与 CORS 预检 OPTIONS）触发：向 stdout 打印一行
  *   「请求首行 + " | ua=" + User-Agent」（watcher 的启动信号，后缀供日志定位调用方），
  *   随即让出端口并保持该连接，
@@ -12,6 +13,9 @@
  * - 触发路径退出码恒为 0（watcher 以 stdout 首行为准），其余退出 = 待命异常。
  */
 import { WATCH_PING_MARKER, WATCH_PING_PATH } from "../runtime";
+
+/** 待命期间收到的非触发请求首行带此前缀打到 stdout，watcher 按前缀判日志行（三份脚本共用）。 */
+export const NOISE_PREFIX = "[watch] ";
 
 const PS_SCRIPT = String.raw`param(
   [string]$BindHost = "127.0.0.1",
@@ -56,6 +60,7 @@ try {
       if ($parts.Length -gt 0) { $method = $parts[0] }
       if ($parts.Length -gt 1) { $path = ($parts[1] -split '\?')[0] }
       if ($method -ieq "GET" -and $path -eq "${WATCH_PING_PATH}") {
+        Write-Output ("${NOISE_PREFIX}" + $firstLine)
         $crlf = "" + [char]13 + [char]10
         $body = "${WATCH_PING_MARKER}"
         $resp = [System.Text.Encoding]::ASCII.GetBytes(
@@ -64,8 +69,8 @@ try {
         $cs.Write($resp, 0, $resp.Length)
         continue
       }
-      if ($method -ieq "GET") { continue }
-      if ($method -notmatch '^(POST|PUT|PATCH|DELETE|OPTIONS)$') { continue }
+      if ($method -ieq "GET") { Write-Output ("${NOISE_PREFIX}" + $firstLine); continue }
+      if ($method -notmatch '^(POST|PUT|PATCH|DELETE|OPTIONS)$') { Write-Output ("${NOISE_PREFIX}" + $firstLine); continue }
       $ua = ""
       foreach ($h in ($request -split '\r?\n')) {
         if ($h -match '^\s*User-Agent:\s*(.+)$') { $ua = $Matches[1].Trim(); break }
@@ -165,14 +170,17 @@ while True:
         method = parts[0].upper() if parts else ""
         path = parts[1].split("?", 1)[0] if len(parts) > 1 else ""
         if method == "GET" and path == "${WATCH_PING_PATH}":
+            print("${NOISE_PREFIX}" + first, flush=True)
             body = "${WATCH_PING_MARKER}".encode()
             head = ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n"
                     "Content-Length: %d\r\n\r\n" % len(body)).encode()
             conn.sendall(head + body)
             continue
         if method == "GET":
+            print("${NOISE_PREFIX}" + first, flush=True)
             continue
         if method not in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+            print("${NOISE_PREFIX}" + first, flush=True)
             continue
         ua = ""
         for hl in data.split(b"\r\n"):
@@ -239,6 +247,7 @@ while True:
 
 const PL_SCRIPT = String.raw`use strict;
 use warnings;
+$| = 1;    # autoflush: request lines must reach the watcher promptly on a pipe
 use IO::Socket::INET;
 use IO::Select;
 
@@ -287,14 +296,15 @@ while (1) {
   my $method = uc($parts[0] // "");
   (my $path = $parts[1] // "") =~ s/\?.*//;
   if ($method eq "GET" && $path eq "${WATCH_PING_PATH}") {
+    print "${NOISE_PREFIX}$first\n";
     my $body = "${WATCH_PING_MARKER}";
     print $conn "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n"
       . "Content-Length: " . length($body) . "\r\n\r\n" . $body;
     close $conn;
     next;
   }
-  if ($method eq "GET") { close $conn; next; }
-  unless ($method =~ /^(POST|PUT|PATCH|DELETE|OPTIONS)$/) { close $conn; next; }
+  if ($method eq "GET") { print "${NOISE_PREFIX}$first\n"; close $conn; next; }
+  unless ($method =~ /^(POST|PUT|PATCH|DELETE|OPTIONS)$/) { print "${NOISE_PREFIX}$first\n"; close $conn; next; }
   my $ua = "";
   for my $hl (split /\r?\n/, $data) {
     if ($hl =~ /^\s*user-agent:\s*(.+?)\s*$/i) { $ua = $1; last; }

@@ -8,7 +8,7 @@
  * 规则自相矛盾（`%` 只在无引号时转义生效，含空格的路径又必须加引号），URL 直接上命令行无法同时
  * 满足；`--output` 同理不进配置文件——不带引号会被空格切成多个文件名，带引号则把引号算进文件名。
  */
-import type { AtelyxCtx, ShellProcessHandle, ShellStreamHandlers } from "../ctx";
+import type { AtelyxCtx, ProcessHandle, ProcessStreamHandlers } from "../ctx";
 import { resolvePlatform } from "./process";
 
 export interface CurlRequest {
@@ -176,7 +176,7 @@ export async function runCurl(ctx: AtelyxCtx, req: CurlRequest): Promise<CurlRes
     const { args } = shellInvocation(platform, configPath, req.output);
     let result;
     try {
-      result = await ctx.shell.exec({ command: platform === "windows" ? "cmd.exe" : "sh", args });
+      result = await ctx.process.exec({ command: platform === "windows" ? "cmd.exe" : "sh", args });
     } catch (err) {
       throw new Error(`${CURL_MISSING_HINT}（${err instanceof Error ? err.message : String(err)}）`);
     }
@@ -196,11 +196,11 @@ export async function spawnCurl(
   ctx: AtelyxCtx,
   req: CurlRequest,
   handlers: { onStderr(line: string): void; onExit(code: number | null): void; onError(message: string): void },
-): Promise<ShellProcessHandle> {
+): Promise<ProcessHandle> {
   const platform = await resolvePlatform(ctx);
   const configPath = await writeConfig(ctx, req);
   const { args } = shellInvocation(platform, configPath, req.output);
-  const raw: ShellStreamHandlers = {
+  const raw: ProcessStreamHandlers = {
     chunk: ({ stream, data }) => {
       if (stream === "stderr") handlers.onStderr(data);
     },
@@ -215,7 +215,7 @@ export async function spawnCurl(
     },
   };
   try {
-    return await ctx.shell.spawn({ command: platform === "windows" ? "cmd.exe" : "sh", args }, raw);
+    return await ctx.process.spawn({ command: platform === "windows" ? "cmd.exe" : "sh", args }, raw);
   } catch (err) {
     await releaseConfig(ctx, configPath);
     throw err;

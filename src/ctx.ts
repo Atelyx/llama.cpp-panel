@@ -5,21 +5,25 @@ import type { Context } from "@atelyx/cordis";
  * 运行时由 Atelyx 注入，所需服务在插件运行时恒在。
  */
 
-/** 进程输出回调（`ctx.shell.spawn` 传 handlers 时启用）。 */
-export interface ShellStreamHandlers {
+/** 进程输出回调（`ctx.process.spawn` 传 handlers 时启用）。 */
+export interface ProcessStreamHandlers {
   chunk(data: { stream: "stdout" | "stderr"; data: string }): void;
   end(data: { code: number | null }): void;
   error(message: string): void;
 }
 
-/** `ctx.shell.spawn` 的进程句柄：`cancel` 结束该进程及其全部子孙（含包装层）。 */
-export interface ShellProcessHandle {
+/** `ctx.process.spawn` 的进程句柄：`cancel` 结束该进程及其全部子孙（含包装层）。 */
+export interface ProcessHandle {
   pid: number;
+  /** 向进程写入 stdin（可反复调用；进程已退出时 reject）。 */
+  write(data: string): Promise<void>;
+  /** 关闭 stdin（对端读到 EOF）。已退出或已关闭时为 no-op。 */
+  endInput(): Promise<void>;
   cancel(): Promise<void>;
 }
 
-/** `ctx.shell.exec` 的聚合结果（非流式：等进程结束一次性给出）。 */
-export interface ShellExecResult {
+/** `ctx.process.exec` 的聚合结果（非流式：等进程结束一次性给出）。 */
+export interface ProcessExecResult {
   code: number | null;
   stdout: string;
   stderr: string;
@@ -79,14 +83,14 @@ export interface AtelyxCtx extends Context {
     /** 本插件私有目录绝对路径（不存在则创建；卸载保留配置时随插件数据保留、彻底卸载清除；更新保留）。 */
     privateDir(): Promise<string>;
   };
-  shell: {
+  process: {
     /** 非流式执行：等进程结束，聚合 stdout/stderr 与退出码（短任务取数用）。 */
-    exec(opts: { command: string; args?: string[]; cwd?: string; env?: Record<string, string> }): Promise<ShellExecResult | undefined>;
+    exec(opts: { command: string; args?: string[]; cwd?: string; env?: Record<string, string> }): Promise<ProcessExecResult | undefined>;
     /** 启动长驻进程并立即拿到句柄（不等进程结束）。 */
     spawn(
       opts: { command: string; args?: string[]; cwd?: string; env?: Record<string, string> },
-      handlers?: ShellStreamHandlers,
-    ): Promise<ShellProcessHandle>;
+      handlers?: ProcessStreamHandlers,
+    ): Promise<ProcessHandle>;
   };
   dialog: {
     pickDirectory(): Promise<string | null>;

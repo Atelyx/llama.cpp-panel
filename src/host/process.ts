@@ -5,7 +5,7 @@
  * 包装层会留下孤儿，故句柄 cancel() 结束整棵进程树，不按命令行特征找进程。
  * 用户选的是文件夹而非可执行文件——发布里文件名随平台变（Windows 带 .exe），按平台名去文件夹里找。
  */
-import type { AtelyxCtx, ListDirResult, ShellStreamHandlers, ShellProcessHandle } from "../ctx";
+import type { AtelyxCtx, ListDirResult, ProcessStreamHandlers, ProcessHandle } from "../ctx";
 import { paramsFor, type LlamaSettings } from "../settings";
 import { describeFsError } from "./models";
 
@@ -169,15 +169,15 @@ export async function startLlama(
   settings: LlamaSettings,
   serverExe: string,
   handlers: StartHandlers,
-): Promise<ShellProcessHandle> {
+): Promise<ProcessHandle> {
   const command = platform === "windows" ? "cmd.exe" : "sh";
   const args = runArgs(platform, buildStartTokens(settings, serverExe));
   const cwd = dirname(settings.modelFile.trim());
   // 宿主只给原始流（chunk/end/error），我的上层回调（onLog/onExit/onError）在此映射
-  const raw: ShellStreamHandlers = {
+  const raw: ProcessStreamHandlers = {
     chunk: ({ stream, data }) => handlers.onLog(data, stream),
     end: ({ code }) => handlers.onExit(code),
     error: (message) => handlers.onError(message),
   };
-  return ctx.shell.spawn({ command, args, ...(cwd ? { cwd } : {}) }, raw);
+  return ctx.process.spawn({ command, args, ...(cwd ? { cwd } : {}) }, raw);
 }
