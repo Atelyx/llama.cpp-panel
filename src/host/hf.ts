@@ -1,12 +1,37 @@
 /**
  * HuggingFace 数据面：搜索、仓库文件树、模型卡。
+ * 取数走宿主 `ctx.http`（Rust 代理，无 CORS；20s 超时 + 1MB 响应上限）；模型下载走 curl，见 curl.ts。
  * 走 `/api/models` 系接口（ModelScope 结构不同，不支持）；体积一次从 tree 接口取全——搜索接口
  * 不带体积，逐个探测会产生几十次请求。网络失败一律翻成可读原因抛出，不兜底静默。
  */
-import type { AtelyxCtx } from "../ctx";
-import { fetchJson, runCurl } from "./curl";
+import type { AtelyxCtx, HttpResponseResult } from "../ctx";
 import { repoApiUrl, readmeUrl, searchApiUrl, type MirrorSource } from "./mirrors";
 import { num, type ModelSummary, type RepoDetail, type RepoFile } from "./types";
+
+/** 发一次请求；非 2xx 翻成带状态码的可读错误。 */
+async function request(ctx: AtelyxCtx, url: string, method: "GET" | "HEAD"): Promise<HttpResponseResult> {
+  let res: HttpResponseResult;
+  try {
+    res = await ctx.http.request({ url, method });
+  } catch (err) {
+    throw new Error(`请求失败：${err instanceof Error ? err.message : String(err)}（${url}）`);
+  }
+  if (res.status < 200 || res.status >= 300) throw new Error(`接口返回 ${res.status}（${url}）`);
+  return res;
+}
+
+async function fetchJson<T>(ctx: AtelyxCtx, url: string): Promise<T> {
+  const res = await request(ctx, url, "GET");
+  // 命中宿主响应上限的正文是半个 JSON：明确报上限，不做无意义的解析
+  if (res.truncated) throw new Error(`接口返回内容超出 1MB 响应上限（${url}）`);
+  const text = res.body.trim();
+  if (!text) throw new Error(`接口没有返回内容（${url}）`);
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`接口返回的不是 JSON（${url}）：${text.slice(0, 120)}`);
+  }
+}
 
 /** 检索结果的排序方式。 */
 export type SearchSort = "downloads" | "likes" | "lastModified";
@@ -92,11 +117,12 @@ export async function fetchRepoDetail(
 /** 取模型卡简介。取不到不算失败——简介是附加信息，不该挡住文件清单。 */
 async function fetchReadme(ctx: AtelyxCtx, mirror: MirrorSource, repo: string): Promise<string> {
   try {
-    // `/raw/` 回的是 Markdown 正文而不是 JSON，按纯文本取；缺失时服务端给 404 + --fail 非零码
-    const result = await runCurl(ctx, { url: readmeUrl(mirror, repo) });
-    if (result.code !== 0) return "";
-    return result
-      .stdout.replace(/^\uFEFF/, "")
+    // `/raw/` 回的是 Markdown 正文而不是 JSON；缺失时服务端给 404
+    const res = await request(ctx, readmeUrl(mirror, repo), "GET");
+    // 宿主响应上限命中时正文被截断：渲染已有部分并注明，不静默吞掉
+    const suffix = res.truncated ? "\n\n（内容过长，已截断显示）" : "";
+    return (res.body + suffix)
+      .replace(/^\uFEFF/, "")
       // 行尾归一为 LF：正文交给宿主 markdown 内核渲染，表格按 \n 切行、不认 \r
       .replace(/\r\n?/g, "\n")
       // YAML front matter（许可证、语言等元数据）不是正文，不参与渲染
@@ -108,13 +134,13 @@ async function fetchReadme(ctx: AtelyxCtx, mirror: MirrorSource, repo: string): 
 
 /**
  * 探取下载地址对应的真实文件大小；拿不到返回 null——体积只用于显示百分比，不是下载的前置条件。
- * 用 HEAD 穿透重定向读最终响应的 Content-Length：HF 第一跳是签名重定向，跟到最后一跳才有总长度。
+ * HEAD 穿透重定向读最终响应的 Content-Length：HF 第一跳是签名重定向，跟到最后一跳才有总长度。
  */
 export async function fetchRemoteInfo(ctx: AtelyxCtx, url: string): Promise<number | null> {
-  // 探测本身失败（写配置失败、网络、镜像不支持 HEAD）也按「体积未知」处理，不把下载挡在门外
-  const result = await runCurl(ctx, { url, method: "HEAD" }).catch(() => null);
-  if (!result || result.code !== 0) return null;
-  const sizes = [...result.stdout.matchAll(/^content-length:\s*(\d+)\s*$/gim)].map((m) => Number(m[1]));
-  const size = sizes.length > 0 ? sizes[sizes.length - 1] : null;
-  return size && size > 0 ? size : null;
+  // 探测本身失败（网络、镜像不支持 HEAD）也按「体积未知」处理，不把下载挡在门外
+  const res = await request(ctx, url, "HEAD").catch(() => null);
+  if (!res) return null;
+  const entry = Object.entries(res.headers).find(([name]) => name.toLowerCase() === "content-length");
+  const size = entry ? Number(entry[1]) : NaN;
+  return Number.isFinite(size) && size > 0 ? size : null;
 }

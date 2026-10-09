@@ -1,9 +1,18 @@
 /**
  * 镜像站表与地址解析。
  * 镜像是整站内容镜像（仓库与文件名一致），换镜像 = 换域名：取用户输入的路径与所选域名重新拼装；
- * ModelScope 地址结构不同，不做域名替换。拼出的地址含 `&`、`=` 等 cmd 元字符，转义交给 curl.ts。
+ * ModelScope 地址结构不同，不做域名替换。
  */
-import { anyToSegment, queryValue } from "./curl";
+
+/** URL 路径段编码（保留 `/` 由调用方按段拼；`!` 转义以免历史展开）。 */
+function anyToSegment(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/** 查询串参数值编码（空格编码为 %20，避免被解释为 `+`）。 */
+function queryValue(value: string): string {
+  return encodeURIComponent(value);
+}
 
 /** 镜像站（HF 通用镜像，纯域名替换）。 */
 export interface MirrorSource {

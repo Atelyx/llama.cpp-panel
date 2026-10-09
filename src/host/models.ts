@@ -149,7 +149,7 @@ export function groupByFolder(scan: { models: ModelEntry[]; projectors: ModelEnt
     .sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
-/** modelsDir + 相对路径 → 模型全路径（用 / 连接，llama-server 与 cmd.exe 均接受）。 */
+/** modelsDir + 相对路径 → 模型全路径（用 / 连接，llama-server 接受）。 */
 export function joinModelPath(modelsDir: string, name: string): string {
   const dir = modelsDir.trim().replace(/\/+$/, "");
   return dir ? `${dir}/${name}` : name;

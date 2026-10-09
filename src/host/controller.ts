@@ -136,8 +136,8 @@ export class HostController {
     if (this.watchDesired()) {
       // 先挂起探测再起占位进程：待命期间端口不对外服务，探测只会白跑
       this.runtime.setSuspended(true);
-      void this.getPlatform()
-        .then((platform) => this.watcher.arm(platform, this.settings, this.watchHooks))
+      void this.watcher
+        .arm(this.settings, this.watchHooks)
         .then((result) => {
           if (!result.ok) {
             void this.classifyArmFailure(result.error ?? "待命进程未能启动");
@@ -375,7 +375,6 @@ export class HostController {
     try {
       const handle = await startLlama(
         this.ctx,
-        platform,
         this.settings,
         exe,
         {

@@ -1,8 +1,8 @@
 /**
  * 启动命令组装与可执行文件定位。
  *
- * 两条约束：进程白名单只放行 cmd.exe / sh，llama-server 必须经包装层（/C、-c）转达；
- * 包装层会留下孤儿，故句柄 cancel() 结束整棵进程树，不按命令行特征找进程。
+ * 参数经宿主进程面直传操作系统（不经 shell 转述），附加参数里的元字符按字面传给 llama-server；
+ * 停止走句柄 cancel() 结束整棵进程树（llama-server 若再派生子孙也在其内）。
  * 用户选的是文件夹而非可执行文件——发布里文件名随平台变（Windows 带 .exe），按平台名去文件夹里找。
  */
 import type { AtelyxCtx, ListDirResult, ProcessStreamHandlers, ProcessHandle } from "../ctx";
@@ -94,7 +94,7 @@ export function missingExecutableMessage(serverDir: string, platform: Platform):
   return `在 ${folder} 里没找到 ${executableName(platform)}`;
 }
 
-/** llama-server 参数（不含包装层）。`--model` 是模型标志（llama.cpp server 惯用写法）。 */
+/** llama-server 参数（不含程序名）。`--model` 是模型标志（llama.cpp server 惯用写法）。 */
 export function buildStartTokens(settings: LlamaSettings, serverExe: string): string[] {
   const model = settings.modelFile.trim();
   if (!model) throw new Error("未选择模型文件");
@@ -134,7 +134,7 @@ function dirname(path: string): string {
   return idx === -1 ? "" : norm.slice(0, idx);
 }
 
-/** 含空白或引号时加引号（仅用于展示与 Unix 的 -c 串）。 */
+/** 含空白或引号时加引号（仅供展示的命令行预览用）。 */
 export function shellQuote(value: string): string {
   return /[\s"\\]/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value;
 }
@@ -142,14 +142,6 @@ export function shellQuote(value: string): string {
 /** 供界面展示的命令行（仅为可读，执行不走它）。 */
 export function describeStartCommand(settings: LlamaSettings, serverExe: string): string {
   return buildStartTokens(settings, serverExe).map(shellQuote).join(" ");
-}
-
-/** 按平台组装执行参数。 */
-function runArgs(platform: Platform, tokens: string[]): string[] {
-  // Windows：/C 之后逐项给，引号交给 Atelyx 按需添加
-  if (platform === "windows") return ["/C", ...tokens];
-  // Unix：-c 只吃一个脚本文本，在这里拼成命令行
-  return ["-c", tokens.map(shellQuote).join(" ")];
 }
 
 /** 启动参数。 */
@@ -165,13 +157,11 @@ export interface StartHandlers {
  */
 export async function startLlama(
   ctx: AtelyxCtx,
-  platform: Platform,
   settings: LlamaSettings,
   serverExe: string,
   handlers: StartHandlers,
 ): Promise<ProcessHandle> {
-  const command = platform === "windows" ? "cmd.exe" : "sh";
-  const args = runArgs(platform, buildStartTokens(settings, serverExe));
+  const tokens = buildStartTokens(settings, serverExe);
   const cwd = dirname(settings.modelFile.trim());
   // 宿主只给原始流（chunk/end/error），我的上层回调（onLog/onExit/onError）在此映射
   const raw: ProcessStreamHandlers = {
@@ -179,5 +169,5 @@ export async function startLlama(
     end: ({ code }) => handlers.onExit(code),
     error: (message) => handlers.onError(message),
   };
-  return ctx.process.spawn({ command, args, ...(cwd ? { cwd } : {}) }, raw);
+  return ctx.process.spawn({ command: serverExe, args: tokens.slice(1), ...(cwd ? { cwd } : {}) }, raw);
 }

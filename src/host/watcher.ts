@@ -1,22 +1,25 @@
 /**
  * 自动启动待命：服务未运行时用占位进程监听服务端口——llama-server 不在时外部只会收到连接拒绝，
- * 占住端口是看见外部调用的唯一途径。触发判定由占位进程过滤（仅真实 API 调用，见 watchScripts），
- * 待命期间本插件对端口的探测挂起：占位进程不对外服务，探测只会得到关闭的连接，纯无谓流量。
- * 触发契约见 watchScripts：stdout 不带前缀的首行到达即触发；带 NOISE_PREFIX 前缀的行是待命期间
- * 收到的非触发请求，经 onNoise 落日志；触发后占位进程转为请求转发器自灭，
- * 句柄就此摘除，disarm 不再取消它；触发前的异常退出 = 待命异常。
+ * 占住端口是看见外部调用的唯一途径。占位进程 = 随应用分发的脚本运行时跑 watchScripts 的 Node 载荷，
+ * 触发判定由占位进程过滤（仅真实 API 调用），待命期间本插件对端口的探测挂起：占位进程不对外服务，
+ * 探测只会得到关闭的连接，纯无谓流量。触发契约见 watchScripts：stdout 不带前缀的首行到达即触发；
+ * 带 NOISE_PREFIX 前缀的行是待命期间收到的非触发请求，经 onNoise 落日志；触发后占位进程转为
+ * 请求转发器自灭，句柄就此摘除，disarm 不再取消它；触发前的异常退出 = 待命异常。
  */
-import type { AtelyxCtx, ProcessHandle, ProcessStreamHandlers } from "../ctx";
+import type { AtelyxCtx, BundledRuntimeInfo, ProcessHandle, ProcessStreamHandlers } from "../ctx";
 import type { LlamaSettings } from "../settings";
-import { shellQuote, type Platform } from "./process";
-import { NOISE_PREFIX, PL_SCRIPT, PS_SCRIPT, PY_SCRIPT } from "./watchScripts";
+import { NOISE_PREFIX, NODE_SCRIPT } from "./watchScripts";
+
+/** 脚本运行时缺失时的可操作提示。 */
+const RUNTIME_MISSING_HINT =
+  "未找到随应用分发的脚本运行时，外部调用自动启动不可用（更新 Atelyx 后重试）";
 
 export interface WatchHooks {
   /** 外部 API 调用触发；requestLine = 触发请求的首行，userAgent = 调用方自报身份（日志定位用）。 */
   onTrigger(requestLine: string, userAgent: string): void;
   /** 待命期间收到的非触发请求（噪音）：首行已去前缀，仅落日志，不触发启动。 */
   onNoise(line: string): void;
-  /** 待命异常结束（绑定失败、解释器缺失等），带可读原因。 */
+  /** 待命异常结束（绑定失败等），带可读原因。 */
   onBroken(reason: string): void;
 }
 
@@ -42,8 +45,8 @@ export class ApiCallWatcher {
   private stderrTail = "";
   /** 触发请求的首行：占位进程经 stdout 带回（不含 ua 后缀），日志与通知用它指明来源。 */
   private triggerLine = "";
-  private scriptDir: string | null = null;
-  private readonly writtenScripts = new Set<string>();
+  private scriptPath: string | null = null;
+  private runtime: BundledRuntimeInfo | null = null;
 
   constructor(ctx: AtelyxCtx) {
     this.ctx = ctx;
@@ -53,8 +56,8 @@ export class ApiCallWatcher {
     return this.handle !== null;
   }
 
-  arm(platform: Platform, settings: LlamaSettings, hooks: WatchHooks): Promise<ArmOutcome> {
-    return this.enqueue(() => this.doArm(platform, settings, hooks));
+  arm(settings: LlamaSettings, hooks: WatchHooks): Promise<ArmOutcome> {
+    return this.enqueue(() => this.doArm(settings, hooks));
   }
 
   /** 解除待命。返回是否真的解除了一个在待命的进程（供调用方决定要不要记日志）。 */
@@ -69,7 +72,7 @@ export class ApiCallWatcher {
     return run;
   }
 
-  private async doArm(platform: Platform, settings: LlamaSettings, hooks: WatchHooks): Promise<ArmOutcome> {
+  private async doArm(settings: LlamaSettings, hooks: WatchHooks): Promise<ArmOutcome> {
     const host = settings.host.trim() || "127.0.0.1";
     const port = settings.port;
     if (this.handle && this.host === host && this.port === port) return { ok: true };
@@ -78,6 +81,10 @@ export class ApiCallWatcher {
     const bindHost = host === "127.0.0.1" || host.toLowerCase() === "localhost" ? "127.0.0.1" : "0.0.0.0";
     // llama-server 将绑定的地址：就绪探测与转发指向它
     const serverHost = host === "0.0.0.0" ? "127.0.0.1" : host;
+
+    const runtime = this.runtime ?? (this.runtime = await this.ctx.process.bundledRuntime().catch(() => null));
+    if (!runtime) return { ok: false, error: RUNTIME_MISSING_HINT };
+    const scriptPath = await this.writeScript();
 
     const gen = ++this.gen;
     this.stderrTail = "";
@@ -132,36 +139,16 @@ export class ApiCallWatcher {
       },
     };
 
-    const spawnOpts =
-      platform === "windows"
-        ? {
-            command: "cmd.exe",
-            args: [
-              "/C",
-              "powershell.exe",
-              "-NoProfile",
-              "-NonInteractive",
-              "-ExecutionPolicy",
-              "Bypass",
-              "-File",
-              await this.writeScript("autostart-watch.ps1", PS_SCRIPT),
-              "-BindHost",
-              bindHost,
-              "-Port",
-              String(port),
-              "-ServerHost",
-              serverHost,
-            ],
-          }
-        : await this.unixSpawnOpts(bindHost, port, serverHost);
-    if (!spawnOpts) {
-      return {
-        ok: false,
-        error: "Linux 上未找到 python3 或 perl，自动启动待命不可用（安装其一后重试）",
-      };
+    let handle: ProcessHandle;
+    try {
+      handle = await this.ctx.process.spawn(
+        { command: runtime.path, args: [scriptPath, bindHost, String(port), serverHost] },
+        raw,
+      );
+    } catch (err) {
+      fail(`待命进程未能启动：${err instanceof Error ? err.message : String(err)}`);
+      return { ok: false, error: broken };
     }
-
-    const handle = await this.ctx.process.spawn(spawnOpts, raw);
     // 句柄落地前进程就已退出：绑定失败等立即报错走这条路，不能再把句柄当「在待命」
     if (ended) {
       return broken ? { ok: false, error: broken } : { ok: true };
@@ -187,36 +174,14 @@ export class ApiCallWatcher {
     return true;
   }
 
-  /** Linux 占位命令：依次探测 python3 → perl，都没有返回 null（调用方给可操作原因）。 */
-  private async unixSpawnOpts(
-    bindHost: string,
-    port: number,
-    serverHost: string,
-  ): Promise<{ command: string; args: string[] } | null> {
-    let interpreter = "";
-    for (const candidate of ["python3", "perl"]) {
-      const found = await this.ctx.process.exec({ command: "sh", args: ["-c", `command -v ${candidate}`] });
-      if (found && found.code === 0 && found.stdout.trim()) {
-        interpreter = candidate;
-        break;
-      }
-    }
-    if (!interpreter) return null;
-    const script = await this.writeScript(
-      interpreter === "perl" ? "autostart-watch.pl" : "autostart-watch.py",
-      interpreter === "perl" ? PL_SCRIPT : PY_SCRIPT,
-    );
-    const line = `${interpreter} ${shellQuote(script)} ${shellQuote(bindHost)} ${String(port)} ${shellQuote(serverHost)}`;
-    return { command: "sh", args: ["-c", line] };
-  }
-
-  private async writeScript(fileName: string, content: string): Promise<string> {
-    const dir = this.scriptDir ?? (this.scriptDir = await this.ctx.fs.privateDir());
-    const path = `${dir}/${fileName}`;
-    if (this.writtenScripts.has(fileName)) return path;
-    const result = await this.ctx.fs.writeFile(path, content);
+  /** 待命脚本写进私有目录（一次即可，跨多次 arm 复用）。 */
+  private async writeScript(): Promise<string> {
+    if (this.scriptPath) return this.scriptPath;
+    const dir = await this.ctx.fs.privateDir();
+    const path = `${dir}/autostart-watch.mjs`;
+    const result = await this.ctx.fs.writeFile(path, NODE_SCRIPT);
     if (!result.ok) throw new Error(`写待命脚本失败：${result.summary}`);
-    this.writtenScripts.add(fileName);
+    this.scriptPath = path;
     return path;
   }
 }

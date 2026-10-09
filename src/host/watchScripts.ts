@@ -1,6 +1,5 @@
 /**
- * 自动启动待命脚本（PowerShell / Python / Perl 三份同语义实现，watcher 写盘后经解释器执行）。
- * 内容保持纯 ASCII：PowerShell 5.1 对无 BOM 文件按 ANSI 读，非 ASCII 注释会变乱码。
+ * 自动启动待命脚本（Node 载荷，watcher 写盘后经随应用分发的脚本运行时执行）。
  *
  * 触发契约（watcher 据此编排）：
  * - 待命：占住端口循环 accept；收到的任何请求（含 GET 类探测与插件握手）把首行带「[watch] 」前缀
@@ -8,346 +7,161 @@
  *   供 runtime 识别自家占位监听；
  * - 触发：仅真实 API 调用（POST/PUT/PATCH/DELETE 与 CORS 预检 OPTIONS）触发：向 stdout 打印一行
  *   「请求首行 + " | ua=" + User-Agent」（watcher 的启动信号，后缀供日志定位调用方），
- *   随即让出端口并保持该连接，
- *   等 llama-server 就绪（/health 不再返回 503，最长 3 分钟）后转发请求、双向回传，完成后自灭；
+ *   随即让出端口并保持该连接，等 llama-server 就绪（/health 不再返回 503，最长 3 分钟）后
+ *   转发请求、双向回传，完成后自然退出；
  * - 触发路径退出码恒为 0（watcher 以 stdout 首行为准），其余退出 = 待命异常。
+ *
+ * 退出一律走 exitCode + 收敛句柄而不是 process.exit：stdout 是管道时写入异步落盘，
+ * process.exit 会截断尚未刷出的触发行，watcher 就收不到启动信号。
  */
 import { WATCH_PING_MARKER, WATCH_PING_PATH } from "../runtime";
 
-/** 待命期间收到的非触发请求首行带此前缀打到 stdout，watcher 按前缀判日志行（三份脚本共用）。 */
+/** 待命期间收到的非触发请求首行带此前缀打到 stdout，watcher 按前缀判日志行。 */
 export const NOISE_PREFIX = "[watch] ";
 
-const PS_SCRIPT = String.raw`param(
-  [string]$BindHost = "127.0.0.1",
-  [int]$Port = 8080,
-  [string]$ServerHost = "127.0.0.1"
-)
-$ErrorActionPreference = "Stop"
+const NODE_SCRIPT = String.raw`import { createServer, createConnection } from "node:net";
 
-function Test-ServerReady {
-  try {
-    $p = [System.Net.Sockets.TcpClient]::new()
-    if (-not $p.ConnectAsync($ServerHost, $Port).Wait(500)) { $p.Close(); return $false }
-    $s = $p.GetStream()
-    $s.ReadTimeout = 500
-    $s.WriteTimeout = 500
-    $req = [System.Text.Encoding]::ASCII.GetBytes("GET /health HTTP/1.0" + [char]13 + [char]10 + [char]13 + [char]10)
-    $s.Write($req, 0, $req.Length)
-    $buf = New-Object byte[] 64
-    $n = $s.Read($buf, 0, 64)
-    $status = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
-    $p.Close()
-    return $status -notmatch ' 503 '
-  } catch { return $false }
+const [bindHost, portArg, serverHost] = process.argv.slice(2);
+const port = Number(portArg);
+const WAIT_MS = 180000;
+const PROBE_MS = 500;
+const IDLE_MS = 300000;
+const HEAD_TIMEOUT_MS = 2000;
+const PING_PATH = "${WATCH_PING_PATH}";
+const PING_MARKER = "${WATCH_PING_MARKER}";
+const NOISE = "${NOISE_PREFIX}";
+
+const say = (line) => { process.stdout.write(line + "\n"); };
+
+function serverReady() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    const socket = createConnection({ host: serverHost, port }, () => {
+      socket.write("GET /health HTTP/1.0\r\n\r\n");
+    });
+    socket.setTimeout(1000, () => done(false));
+    socket.on("error", () => done(false));
+    socket.on("data", (chunk) => {
+      const first = chunk.toString("latin1").split("\r\n", 1)[0] || "";
+      done(first !== "" && first.indexOf(" 503 ") === -1);
+    });
+    socket.on("close", () => done(false));
+  });
 }
 
-$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($BindHost), $Port)
-$listener.Start()
-try {
-  while ($true) {
-    $client = $listener.AcceptTcpClient()
-    try {
-      $cs = $client.GetStream()
-      $cs.ReadTimeout = 2000
-      $chunk = New-Object byte[] 65536
-      try { $read = $cs.Read($chunk, 0, $chunk.Length) } catch { continue }
-      if ($read -le 0) { continue }
-      $request = [System.Text.Encoding]::ASCII.GetString($chunk, 0, $read)
-      $firstLine = ($request -split '\r?\n')[0].Trim()
-      $parts = $firstLine -split '\s+'
-      $method = ""
-      $path = ""
-      if ($parts.Length -gt 0) { $method = $parts[0] }
-      if ($parts.Length -gt 1) { $path = ($parts[1] -split '\?')[0] }
-      if ($method -ieq "GET" -and $path -eq "${WATCH_PING_PATH}") {
-        Write-Output ("${NOISE_PREFIX}" + $firstLine)
-        $crlf = "" + [char]13 + [char]10
-        $body = "${WATCH_PING_MARKER}"
-        $resp = [System.Text.Encoding]::ASCII.GetBytes(
-          "HTTP/1.1 200 OK" + $crlf + "Content-Type: text/plain" + $crlf +
-          "Access-Control-Allow-Origin: *" + $crlf + "Content-Length: " + $body.Length + $crlf + $crlf + $body)
-        $cs.Write($resp, 0, $resp.Length)
-        continue
-      }
-      if ($method -ieq "GET") { Write-Output ("${NOISE_PREFIX}" + $firstLine); continue }
-      if ($method -notmatch '^(POST|PUT|PATCH|DELETE|OPTIONS)$') { Write-Output ("${NOISE_PREFIX}" + $firstLine); continue }
-      $ua = ""
-      foreach ($h in ($request -split '\r?\n')) {
-        if ($h -match '^\s*User-Agent:\s*(.+)$') { $ua = $Matches[1].Trim(); break }
-      }
-      Write-Output ($firstLine + " | ua=" + $ua)
-      $listener.Stop()
+const server = createServer((socket) => {
+  const chunks = [];
+  let size = 0;
+  let routed = false;
+  const timer = setTimeout(() => { socket.destroy(); }, HEAD_TIMEOUT_MS);
+  socket.on("error", () => socket.destroy());
+  socket.on("close", () => clearTimeout(timer));
+  socket.on("data", (chunk) => {
+    if (routed) return;
+    chunks.push(chunk);
+    size += chunk.length;
+    const head = Buffer.concat(chunks, size);
+    if (head.indexOf("\r\n\r\n") === -1 && head.indexOf("\n\n") === -1 && size < 65536) return;
+    routed = true;
+    clearTimeout(timer);
+    route(socket, head);
+  });
+});
 
-      # hold the connection and keep buffering the client request while waiting
-      $ms = New-Object System.IO.MemoryStream
-      $ms.Write($chunk, 0, $read)
-      $cs.ReadTimeout = 250
-      $deadline = [DateTime]::UtcNow.AddSeconds(180)
-      $ready = $false
-      while ([DateTime]::UtcNow -lt $deadline) {
-        try {
-          $n = $cs.Read($chunk, 0, $chunk.Length)
-          if ($n -le 0) { exit 0 }
-          $ms.Write($chunk, 0, $n)
-        } catch { }
-        if (Test-ServerReady) { $ready = $true; break }
-      }
-      if (-not $ready) { exit 0 }
+server.on("error", (err) => {
+  process.stderr.write((err && err.code === "EADDRINUSE" ? "端口已被占用" : String(err)) + "\n");
+  process.exit(1);
+});
 
-      # blind byte relay both directions: no HTTP parsing, streaming (SSE) passes through
-      $server = [System.Net.Sockets.TcpClient]::new()
-      if (-not $server.ConnectAsync($ServerHost, $Port).Wait(5000)) { exit 0 }
-      $ss = $server.GetStream()
-      $ss.WriteTimeout = 10000
-      $sb = $ms.ToArray()
-      $ss.Write($sb, 0, $sb.Length)
-      $last = [DateTime]::UtcNow
-      while ($true) {
-        $moved = $false
-        try {
-          if ($cs.DataAvailable) {
-            $n = $cs.Read($chunk, 0, $chunk.Length)
-            if ($n -le 0) { break }
-            $ss.Write($chunk, 0, $n)
-            $last = [DateTime]::UtcNow
-            $moved = $true
-          }
-        } catch { break }
-        try {
-          if ($ss.DataAvailable) {
-            $n = $ss.Read($chunk, 0, $chunk.Length)
-            if ($n -le 0) { break }
-            $cs.Write($chunk, 0, $n)
-            $last = [DateTime]::UtcNow
-            $moved = $true
-          }
-        } catch { break }
-        if (-not $moved) { Start-Sleep -Milliseconds 10 }
-        if (([DateTime]::UtcNow - $last).TotalSeconds -gt 300) { break }
-      }
-      exit 0
-    } finally { $client.Close() }
+server.listen(port, bindHost);
+
+function route(socket, head) {
+  const text = head.toString("latin1");
+  const first = (text.split("\n", 1)[0] || "").replace(/\r$/, "").trim();
+  const parts = first.split(/\s+/);
+  const method = (parts[0] || "").toUpperCase();
+  const path = (parts[1] || "").split("?", 1)[0];
+  if (method === "GET" && path === PING_PATH) {
+    say(NOISE + first);
+    socket.end(
+      "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n" +
+      "Content-Length: " + PING_MARKER.length + "\r\n\r\n" + PING_MARKER,
+    );
+    return;
   }
-} finally {
-  try { $listener.Stop() } catch { }
-}`;
-
-const PY_SCRIPT = String.raw`import socket
-import sys
-import threading
-import time
-
-bind_host, port, server_host = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-WAIT_SECONDS = 180
-IDLE_SECONDS = 300
-
-def server_ready():
-    try:
-        s = socket.create_connection((server_host, port), timeout=0.5)
-        s.sendall(b"GET /health HTTP/1.0\r\n\r\n")
-        status = s.recv(64).decode("latin-1", "replace")
-        s.close()
-        return " 503 " not in status
-    except OSError:
-        return False
-
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind((bind_host, port))
-srv.listen(4)
-while True:
-    conn, _ = srv.accept()
-    try:
-        conn.settimeout(2)
-        try:
-            data = conn.recv(65536)
-        except OSError:
-            continue
-        if not data:
-            continue
-        first = data.split(b"\r\n", 1)[0].decode("latin-1", "replace").strip()
-        parts = first.split()
-        method = parts[0].upper() if parts else ""
-        path = parts[1].split("?", 1)[0] if len(parts) > 1 else ""
-        if method == "GET" and path == "${WATCH_PING_PATH}":
-            print("${NOISE_PREFIX}" + first, flush=True)
-            body = "${WATCH_PING_MARKER}".encode()
-            head = ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n"
-                    "Content-Length: %d\r\n\r\n" % len(body)).encode()
-            conn.sendall(head + body)
-            continue
-        if method == "GET":
-            print("${NOISE_PREFIX}" + first, flush=True)
-            continue
-        if method not in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
-            print("${NOISE_PREFIX}" + first, flush=True)
-            continue
-        ua = ""
-        for hl in data.split(b"\r\n"):
-            if hl[:11].lower() == b"user-agent:":
-                ua = hl[11:].strip().decode("latin-1", "replace")
-                break
-        print(first + " | ua=" + ua, flush=True)
-        srv.close()  # yield the port; keep the client for forwarding
-        buf = bytearray(data)
-        conn.settimeout(0.25)
-        deadline = time.time() + WAIT_SECONDS
-        ready = False
-        next_probe = 0.0
-        while time.time() < deadline:
-            try:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    sys.exit(0)
-                buf += chunk
-            except OSError:
-                pass
-            now = time.time()
-            if now >= next_probe:
-                next_probe = now + 0.5
-                if server_ready():
-                    ready = True
-                    break
-        if not ready:
-            conn.close()
-            sys.exit(0)
-        try:
-            up = socket.create_connection((server_host, port), timeout=5)
-        except OSError:
-            conn.close()
-            sys.exit(0)
-        up.sendall(bytes(buf))
-        conn.settimeout(IDLE_SECONDS)
-        up.settimeout(IDLE_SECONDS)
-        def pump(a, b):
-            try:
-                while True:
-                    d = a.recv(65536)
-                    if not d:
-                        break
-                    b.sendall(d)
-            except OSError:
-                pass
-            try:
-                b.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-        threading.Thread(target=pump, args=(conn, up), daemon=True).start()
-        try:
-            while True:
-                d = up.recv(65536)
-                if not d:
-                    break
-                conn.sendall(d)
-        except OSError:
-            pass
-        sys.exit(0)
-    finally:
-        conn.close()`;
-
-const PL_SCRIPT = String.raw`use strict;
-use warnings;
-$| = 1;    # autoflush: request lines must reach the watcher promptly on a pipe
-use IO::Socket::INET;
-use IO::Select;
-
-$SIG{PIPE} = "IGNORE";
-my ($bind_host, $port, $server_host) = @ARGV;
-my $srv = IO::Socket::INET->new(
-  LocalAddr => $bind_host, LocalPort => $port, Proto => "tcp", Listen => 5, ReuseAddr => 1,
-) or die "bind $bind_host:$port failed: $!";
-
-sub server_ready {
-  my $s = IO::Socket::INET->new(PeerAddr => $server_host, PeerPort => $port, Proto => "tcp", Timeout => 0.5);
-  return 0 unless $s;
-  print $s "GET /health HTTP/1.0\r\n\r\n";
-  my $status = "";
-  $s->recv($status, 64);
-  $s->close;
-  return $status !~ / 503 / ? 1 : 0;
+  if (method !== "POST" && method !== "PUT" && method !== "PATCH" && method !== "DELETE" && method !== "OPTIONS") {
+    say(NOISE + first);
+    socket.destroy();
+    return;
+  }
+  let ua = "";
+  const match = text.match(/^user-agent:[ \t]*(.*)$/im);
+  if (match) ua = match[1].trim();
+  say(first + " | ua=" + ua);
+  server.close();
+  forward(socket, head);
 }
 
-sub flush_write {
-  my ($socket, $bytes) = @_;
-  my $off = 0;
-  while ($off < length($bytes)) {
-    my $n = syswrite($socket, $bytes, length($bytes) - $off, $off);
-    return 0 unless defined $n;
-    $off += $n;
-  }
-  return 1;
+function forward(socket, head) {
+  const chunks = [head];
+  let clientGone = false;
+  let relaying = false;
+  socket.on("error", () => {});
+  socket.on("close", () => { clientGone = true; });
+  socket.on("data", (chunk) => { chunks.push(chunk); });
+  const deadline = Date.now() + WAIT_MS;
+  const poll = setInterval(() => {
+    if (clientGone || Date.now() >= deadline) {
+      clearInterval(poll);
+      socket.destroy();
+      process.exitCode = 0;
+      return;
+    }
+    serverReady().then((ready) => {
+      if (!ready || clientGone || relaying) return;
+      relaying = true;
+      clearInterval(poll);
+      relay(socket, Buffer.concat(chunks));
+    });
+  }, PROBE_MS);
 }
 
-while (1) {
-  my $conn = $srv->accept or die "accept failed: $!";
-  $conn->blocking(0);
-  my $data = "";
-  {
-    my $sel0 = IO::Select->new($conn);
-    if ($sel0->can_read(2)) {
-      my $n = sysread($conn, $data, 65536);
-      $data = "" unless defined $n && $n > 0;
-    }
-  }
-  if ($data eq "") { close $conn; next; }
-  (my $first = $data) =~ s/\r?\n.*//s;
-  $first =~ s/\s+$//;
-  my @parts = split /\s+/, $first;
-  my $method = uc($parts[0] // "");
-  (my $path = $parts[1] // "") =~ s/\?.*//;
-  if ($method eq "GET" && $path eq "${WATCH_PING_PATH}") {
-    print "${NOISE_PREFIX}$first\n";
-    my $body = "${WATCH_PING_MARKER}";
-    print $conn "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\n"
-      . "Content-Length: " . length($body) . "\r\n\r\n" . $body;
-    close $conn;
-    next;
-  }
-  if ($method eq "GET") { print "${NOISE_PREFIX}$first\n"; close $conn; next; }
-  unless ($method =~ /^(POST|PUT|PATCH|DELETE|OPTIONS)$/) { print "${NOISE_PREFIX}$first\n"; close $conn; next; }
-  my $ua = "";
-  for my $hl (split /\r?\n/, $data) {
-    if ($hl =~ /^\s*user-agent:\s*(.+?)\s*$/i) { $ua = $1; last; }
-  }
-  print "$first | ua=$ua\n";
-  close $srv;    # yield the port; keep the client for forwarding
-  undef $srv;
-  my $buf = $data;
-  my $deadline = time() + 180;
-  my $ready = 0;
-  my $next_probe = 0;
-  my $selc = IO::Select->new($conn);
-  while (time() < $deadline) {
-    if ($selc->can_read(0.25)) {
-      my $chunk;
-      my $n = sysread($conn, $chunk, 65536);
-      exit 0 if defined $n && $n == 0;    # client gave up
-      $buf .= $chunk if $n;
-    }
-    if (time() >= $next_probe) {
-      $next_probe = time() + 0.5;
-      if (server_ready()) { $ready = 1; last; }
-    }
-  }
-  exit 0 unless $ready;
-  my $up = IO::Socket::INET->new(PeerAddr => $server_host, PeerPort => $port, Proto => "tcp", Timeout => 5) or exit 0;
-  $up->blocking(0);
-  exit 0 unless flush_write($up, $buf);
-  my $sel = IO::Select->new($conn, $up);
-  my $last = time();
-  while (1) {
-    my @readable = $sel->can_read(0.25);
-    for my $sock (@readable) {
-      my $chunk;
-      my $n = sysread($sock, $chunk, 65536);
-      if (!defined $n || $n == 0) { $sel->remove($sock); next; }
-      my $dst = $sock == $conn ? $up : $conn;
-      exit 0 unless flush_write($dst, $chunk);
-      $last = time();
-    }
-    exit 0 if $sel->count == 0;
-    exit 0 if time() - $last > 300;
-  }
-}`;
+function relay(client, body) {
+  const upstream = createConnection({ host: serverHost, port });
+  let last = Date.now();
+  const touch = () => { last = Date.now(); };
+  let connectGuard;
+  let idle;
+  const finish = () => {
+    clearTimeout(connectGuard);
+    clearInterval(idle);
+    client.destroy();
+    upstream.destroy();
+  };
+  // llama-server 绑定成功后 connect 是毫秒级；连不上（防火墙丢包）5 秒放弃，客户端重试
+  connectGuard = setTimeout(finish, 5000);
+  idle = setInterval(() => {
+    if (Date.now() - last > IDLE_MS) finish();
+  }, 10000);
+  client.on("error", finish);
+  upstream.on("error", finish);
+  client.on("close", finish);
+  upstream.on("close", finish);
+  upstream.on("connect", () => {
+    clearTimeout(connectGuard);
+    upstream.write(body);
+    client.on("data", touch);
+    upstream.on("data", touch);
+    client.pipe(upstream);
+    upstream.pipe(client);
+  });
+}
+`;
 
-export { PS_SCRIPT, PY_SCRIPT, PL_SCRIPT };
+export { NODE_SCRIPT };

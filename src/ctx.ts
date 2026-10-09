@@ -12,7 +12,9 @@ export interface ProcessStreamHandlers {
   error(message: string): void;
 }
 
-/** `ctx.process.spawn` 的进程句柄：`cancel` 结束该进程及其全部子孙（含包装层）。 */
+/**
+ * `ctx.process.spawn` 的进程句柄：`cancel` 结束该进程及其全部子孙（含包装层）。
+ */
 export interface ProcessHandle {
   pid: number;
   /** 向进程写入 stdin（可反复调用；进程已退出时 reject）。 */
@@ -20,13 +22,6 @@ export interface ProcessHandle {
   /** 关闭 stdin（对端读到 EOF）。已退出或已关闭时为 no-op。 */
   endInput(): Promise<void>;
   cancel(): Promise<void>;
-}
-
-/** `ctx.process.exec` 的聚合结果（非流式：等进程结束一次性给出）。 */
-export interface ProcessExecResult {
-  code: number | null;
-  stdout: string;
-  stderr: string;
 }
 
 /** 单层目录条目（对应宿主 `external_list_dir`，目录在前、按名升序、含隐藏项）。 */
@@ -61,10 +56,38 @@ export interface PluginDefaultLayoutSpec {
   tree: PluginLayoutSpecNode;
 }
 
+/** `ctx.process.bundledRuntime()` 的查询结果（随应用分发的脚本运行时）。 */
+export interface BundledRuntimeInfo {
+  /** 可执行绝对路径（可直接作为 spawn 的 command）。 */
+  path: string;
+  /** 运行时版本（Node 版本号）。 */
+  version: string;
+}
+
+/** `ctx.http.request` 的输入（method 缺省 GET）。 */
+export interface HttpRequestInput {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+/** `ctx.http.request` 的响应（正文为文本；truncated = 命中宿主响应上限被截断）。 */
+export interface HttpResponseResult {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+  truncated: boolean;
+}
+
 export interface AtelyxCtx extends Context {
-  /** 宿主平台信息（平台决定启动命令写法）。 */
+  /** 宿主平台信息（平台决定可执行文件名，Windows 带 `.exe`）。 */
   app: {
     platform(): Promise<string>;
+  };
+  /** 通用 HTTP 请求（宿主 Rust 代理：无 CORS；20s 超时 + 1MB 响应上限；大文件下载不适用）。 */
+  http: {
+    request(req: HttpRequestInput): Promise<HttpResponseResult>;
   };
   /** 插件设置存储（整表落插件目录；值须 JSON 可序列化）。 */
   state: {
@@ -84,13 +107,13 @@ export interface AtelyxCtx extends Context {
     privateDir(): Promise<string>;
   };
   process: {
-    /** 非流式执行：等进程结束，聚合 stdout/stderr 与退出码（短任务取数用）。 */
-    exec(opts: { command: string; args?: string[]; cwd?: string; env?: Record<string, string> }): Promise<ProcessExecResult | undefined>;
     /** 启动长驻进程并立即拿到句柄（不等进程结束）。 */
     spawn(
       opts: { command: string; args?: string[]; cwd?: string; env?: Record<string, string> },
       handlers?: ProcessStreamHandlers,
     ): Promise<ProcessHandle>;
+    /** 随应用分发的脚本运行时（Node）；未分发的平台返回 null。 */
+    bundledRuntime(): Promise<BundledRuntimeInfo | null>;
   };
   dialog: {
     pickDirectory(): Promise<string | null>;

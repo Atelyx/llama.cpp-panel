@@ -13,7 +13,7 @@
     "scope": "app",
     "bundle": true,
     "tagline": "下载 gguf 模型（支持镜像站）· 托管启动 llama-server · 状态与日志",
-    "atelyxVersionMin": "0.5.0",
+    "atelyxVersionMin": "0.5.9",
     "keepMountedOnVaultSwitch": true,
     "platforms": ["windows-x64", "linux-x64"]
   }
