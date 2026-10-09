@@ -143,6 +143,8 @@ export interface AtelyxCtx extends Context {
       key: string;
       label: string;
       component: (() => unknown) | unknown;
+      /** 设置页 tab 的自定义图标（可选，与 lucide 同构：接 size/className）；缺省用宿主统一的插件图标。 */
+      icon?: (props: { size?: number | string; className?: string }) => unknown;
     }): () => void;
     registerCommand(opts: {
       id: string;

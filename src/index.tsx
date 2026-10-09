@@ -15,7 +15,7 @@ import { LibraryView } from "./views/Library";
 import { InstalledView } from "./views/Installed";
 import { LogsView } from "./views/Logs";
 import { SettingsView } from "./views/Settings";
-import { PANEL_CSS, bgPrimary, textMuted, fontUi } from "./views/ui";
+import { LlamaChipIcon, PANEL_CSS, bgPrimary, textMuted, fontUi } from "./views/ui";
 
 /** 与清单里的 name 一致。 */
 const PLUGIN_ID = "com.atelyx.llama.cpp-panel";
@@ -156,6 +156,7 @@ export default function apply(pluginCtx: AtelyxCtx): void {
       key: SETTING_KEY,
       label: "llama.cpp",
       component: SettingsPanelView,
+      icon: LlamaChipIcon,
     });
     return () => {
       for (const off of offViews) off();

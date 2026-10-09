@@ -605,3 +605,37 @@ export function useSplitLayout(collapseAt: number): { ref: { current: HTMLDivEle
   }, [collapseAt]);
   return { ref, stacked };
 }
+
+/**
+ * llama 芯片图标：芯片本体 + 一对耳朵 + 眼鼻，作本插件的标识图形。
+ * 与 lucide 图标同构（24 viewBox、stroke currentColor、接 size/className），供宿主设置页 tab 渲染。
+ */
+export function LlamaChipIcon({ size = 24, className }: { size?: number | string; className?: string }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <rect x="5" y="6" width="14" height="14" rx="2" />
+      <path d="M9.5 6 9 3.2" />
+      <path d="M14.5 6 15 3.2" />
+      <path d="M5 11H3" />
+      <path d="M5 16H3" />
+      <path d="M19 11h2" />
+      <path d="M19 16h2" />
+      <path d="M9.5 20v2" />
+      <path d="M14.5 20v2" />
+      <path d="M9.75 12h.01" />
+      <path d="M14.25 12h.01" />
+      <path d="M12 14.5v2" />
+    </svg>
+  );
+}
