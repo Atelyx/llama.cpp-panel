@@ -1,0 +1,13 @@
+{
+  "id": "com.atelyx.llama-cpp-panel",
+  "name": "llama.cpp 启动面板",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "entry": {
+    "windows": "llama-cpp-panel.exe",
+    "linux": "llama-cpp-panel"
+  },
+  "permissions": ["process", "state", "notification", "dialog"],
+  "singleton": true,
+  "keepMountedOnVaultSwitch": true
+}

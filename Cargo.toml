@@ -1,0 +1,24 @@
+[package]
+name = "llama-cpp-panel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Atelyx 的 llama.cpp 启动面板插件：检索下载 gguf 模型、托管启停 llama-server 并查看状态与日志"
+license = "MIT"
+
+[dependencies]
+atelyx-plugin-sdk = { path = "../../Atelyx/atelyx-plugin-sdk" }
+atelyx-plugin-protocol = { path = "../../Atelyx/atelyx-plugin-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 日志时间戳取本地时区时刻（std 只有 UTC）
+chrono = "0.4"
+# 连接泵与插件自身任务：rt/macros 供主函数，net 供待命监听，fs 供下载落盘
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util", "net", "fs"] }
+async-trait = "0.1"
+# 公网取数与下载由插件直连：宿主 http 面把整个响应 base64 编进单条应答，无流式与进度，不适用大文件
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[profile.release]
+strip = true
+lto = true
