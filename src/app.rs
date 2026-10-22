@@ -399,6 +399,17 @@ pub async fn initialize(app: &Arc<App>) {
             eprintln!("贡献注册失败（{label}）：{err}");
         }
     }
+    for surface in [SURFACE_CONSOLE, SURFACE_LIBRARY, SURFACE_SETTINGS] {
+        let build_app = Arc::clone(app);
+        let build_surface = surface.to_string();
+        app.ctx
+            .ui()
+            .mount(surface, move || {
+                let core = build_app.core();
+                views::build(&core, &build_surface).expect("已注册的面都有树")
+            })
+            .await;
+    }
     tokio::spawn(render_loop(Arc::clone(app)));
     tokio::spawn(process_consumer(Arc::clone(app)));
     tokio::spawn(probe_loop(Arc::clone(app)));
@@ -441,23 +452,17 @@ async fn render_loop(app: Arc<App>) {
 }
 
 async fn render_attached(app: &Arc<App>) {
-    {
-        let attached: Vec<String> = app.core().attached.iter().cloned().collect();
-        for surface in attached {
-            let tree = {
-                let core = app.core();
-                views::build(&core, &surface)
-            };
-            if let Some(tree) = tree {
-                if let Err(err) = app.ctx.submit_view(&surface, tree).await {
-                    eprintln!("界面提交失败（{surface}）：{err}");
-                    continue;
-                }
-                // 树挂载后再滚：新行已在宿主侧；指令只在新行落地后发一次
+    let attached: Vec<String> = app.core().attached.iter().cloned().collect();
+    for surface in attached {
+        match app.ctx.ui().notify(&surface).await {
+            Ok(true) => {
+                // 树已上行后再滚：新行已在宿主侧；指令只在新行落地后发一次
                 if surface == SURFACE_CONSOLE {
                     follow_logs(app).await;
                 }
             }
+            Ok(false) => {}
+            Err(err) => eprintln!("界面提交失败（{surface}）：{err}"),
         }
     }
 }
@@ -527,7 +532,7 @@ pub async fn scan_models(app: &Arc<App>) {
     app.invalidate();
 }
 
-/// 宿主面挂载 / 移除：挂载即立即出树（不等下一次状态变化）。
+/// 宿主面挂载 / 移除：树由 SDK 在回调前重发，这里只维护本地面状态。
 pub fn on_surface(app: &Arc<App>, surface_id: &str, attached: bool) {
     if attached {
         {
@@ -537,6 +542,11 @@ pub fn on_surface(app: &Arc<App>, surface_id: &str, attached: bool) {
             if surface_id == SURFACE_CONSOLE {
                 core.host_mut().scrolled_seq = 0;
             }
+        }
+        if surface_id == SURFACE_CONSOLE {
+            // 重发的树已在宿主侧，列表此刻才能滚
+            let app = Arc::clone(app);
+            tokio::spawn(async move { follow_logs(&app).await });
         }
         // 模型商店首开自动加载首页列表（热门排序），无需先输入关键词
         if surface_id == SURFACE_LIBRARY {
@@ -554,7 +564,6 @@ pub fn on_surface(app: &Arc<App>, surface_id: &str, attached: bool) {
     } else {
         app.core().attached.remove(surface_id);
     }
-    app.invalidate();
 }
 
 /// 宿主界面事件路由（按面与节点 id）。
