@@ -115,16 +115,17 @@ fn results_pane(core: &Core) -> ViewNode {
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.summary.repo == summary.repo);
+            // 整卡可点展开详情：仓库名是普通文字，命中面就是整卡
             row_card(
                 format!("rcard{index}"),
                 selected,
                 vec![
-                    button(
-                        format!("r{index}"),
+                    text_sized(
+                        format!("rcard{index}-name"),
                         summary.repo.clone(),
-                        ButtonVariant::Ghost,
-                        true,
-                        vec![EventKind::Click],
+                        1.0,
+                        TextWeight::Medium,
+                        ColorToken::Text,
                     ),
                     spread_row(
                         format!("rmeta{index}"),
@@ -204,20 +205,23 @@ fn detail_pane(core: &Core) -> Vec<ViewNode> {
         children.push(caption("detail-files-empty", "该仓库没有 .gguf 文件，可能只提供原始权重。"));
     }
     for (index, file) in detail.files.iter().enumerate() {
-        // 文件相对路径占满左半（长路径会把同行控件顶出可视区，故给占宽行），体积与下载钮贴右
-        children.push(fill_row(
+        // 文件相对路径占满左半（长路径会把同行控件顶出可视区，故给占宽行），体积与下载钮贴右；
+        // 下载钮常显（悬停钮在触摸设备上没有着点），整行可聚焦：右键 / 回车 / 空格都触发下载
+        let mut file_row = fill_row(
             format!("frow{index}"),
             vec![
-                text_fill(format!("fname{index}"), file.name.clone(), ColorToken::TextSecondary),
+                text_fill(format!("fname{index}"), file.name.clone(), ColorToken::TextSecondary, Some(2)),
                 row(
                     format!("fright{index}"),
                     vec![
                         chip(format!("fsize{index}"), size_label(file.size), ColorToken::TextSecondary),
-                        icon_button(format!("f{index}"), "download", "下载", true, true, vec![EventKind::Click]),
+                        icon_button(format!("f{index}"), "download", "下载", true, vec![EventKind::Click]),
                     ],
                 ),
             ],
-        ));
+        );
+        file_row.events = vec![EventKind::SecondaryClick, EventKind::Key];
+        children.push(with_interaction(file_row, focus_border()));
     }
 
     if !detail.readme.is_empty() {
@@ -256,7 +260,7 @@ fn download_card(core: &Core) -> ViewNode {
         if let Some(total) = task.total_bytes.filter(|total| *total > 0) {
             children.push(node(
                 "dl-bar",
-                NodeBody::Progress { value: task.bytes as f64 / total as f64, girth: None, tone: None },
+                NodeBody::Progress { value: task.bytes as f64 / total as f64, girth: Some(6.0), tone: None },
             ));
         }
     }

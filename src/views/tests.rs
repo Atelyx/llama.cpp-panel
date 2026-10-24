@@ -1,6 +1,7 @@
 //! 界面树构建的单元测试：树结构合法性、状态组合下的投影，以及过滤与翻页判定。
 
 use super::*;
+use atelyx_plugin_protocol::view::TextFamily;
 use crate::app::SURFACE_CONSOLE;
 use crate::download::DownloadStatus;
 use crate::modelscan::{ModelEntry, ModelFolder};
@@ -15,6 +16,8 @@ fn test_core() -> Core {
         lib: Default::default(),
         scan: Default::default(),
         dl: crate::download::DownloadTask::idle(),
+        tray_supported: true,
+        tray_signature: String::new(),
     }
 }
 
@@ -73,7 +76,7 @@ fn library_tree_survives_state_combinations() {
     core.dl.total_bytes = Some(1000);
     let tree = build(&core, SURFACE_LIBRARY).unwrap();
     tree.validate().unwrap();
-    assert!(tree.find("r0").is_some());
+    assert!(tree.find("rcard0").is_some());
     assert!(tree.find("f0").is_some());
     assert!(tree.find("detail-title").is_some());
     assert!(tree.find("dl-bar").is_some(), "下载中给进度条");
@@ -111,10 +114,11 @@ fn console_tree_survives_state_combinations() {
         time: "10:00:00".into(),
         text: "listening on 127.0.0.1:8080".into(),
         tone: crate::app::LogTone::Normal,
+        ansi: None,
     });
     let tree = build(&core, SURFACE_CONSOLE).unwrap();
     tree.validate().unwrap();
-    assert!(tree.find("pick0").is_some());
+    assert!(tree.find("fcard0").is_some());
     assert!(tree.find("quant").is_some(), "选中模型后出参数表单");
     assert!(tree.find("logs-cmd").is_some(), "命令预览始终可读");
     assert!(tree.find("log1").is_some());
@@ -127,8 +131,96 @@ fn library_direct_input_declares_change() {
     let tree = build(&core, SURFACE_LIBRARY).unwrap();
     let input = tree.find("dlinput").expect("直链下载输入框");
     // 未声明 Change 即不上行：输入框的值永远回不来，「下载」钮会成哑钮
-    assert!(input.events.contains(&EventKind::Change), "直链输入要逐键回写");
+    assert!(input.events.contains(&EventKind::Change), "直链输入改动要回写");
     assert!(input.events.contains(&EventKind::Submit), "回车即下载");
+}
+
+#[test]
+fn model_and_result_cards_are_clickable_as_a_whole() {
+    let mut core = test_core();
+    core.scan.folders = vec![folder("qwen/Qwen3-14B")];
+    core.lib.results.push(summary("Qwen/Qwen3.5-9B"));
+    let tree = build(&core, SURFACE_CONSOLE).unwrap();
+    let card = tree.find("fcard0").expect("模型卡片");
+    assert!(card.events.contains(&EventKind::Click), "整卡承接点击");
+    assert!(card.interaction.is_some(), "悬停与选中态由 interaction 档位承担");
+    assert!(tree.find("fcard0-name").is_some(), "名称是普通文字");
+    assert!(tree.find("pick0").is_none(), "卡片内不再有独立按钮");
+
+    let tree = build(&core, SURFACE_LIBRARY).unwrap();
+    let card = tree.find("rcard0").expect("结果卡片");
+    assert!(card.events.contains(&EventKind::Click), "整卡承接点击");
+    assert!(tree.find("rcard0-name").is_some());
+    assert!(tree.find("r0").is_none());
+}
+
+#[test]
+fn file_rows_are_operable_without_hover() {
+    let mut core = test_core();
+    core.lib.detail = Some(crate::hf::RepoDetail {
+        summary: summary("Qwen/Qwen3.5-9B"),
+        gated: false,
+        files: vec![crate::hf::RepoFile { name: "a.gguf".into(), size: Some(1) }],
+        readme: String::new(),
+    });
+    let tree = build(&core, SURFACE_LIBRARY).unwrap();
+    let row = tree.find("frow0").expect("文件行节点");
+    assert!(row.events.contains(&EventKind::SecondaryClick), "右键即下载");
+    assert!(row.events.contains(&EventKind::Key), "焦点回车/空格即下载");
+    assert!(row.interaction.is_some(), "焦点框让键盘用户看见当前行");
+    let icon = tree.find("f0").expect("下载钮");
+    assert!(
+        !matches!(&icon.body, NodeBody::IconButton { hover_only: Some(true), .. }),
+        "下载钮常显，不依赖悬停"
+    );
+    assert!(
+        matches!(&tree.find("fname0").unwrap().body, NodeBody::Text { max_lines: Some(2), .. }),
+        "长文件名两行收口"
+    );
+}
+
+#[test]
+fn number_params_report_on_commit() {
+    let mut core = test_core();
+    core.scan.folders = vec![folder("qwen/Qwen3-14B")];
+    core.settings.model_file = "/models/qwen/Qwen3-14B/q5.gguf".into();
+    let tree = build(&core, SURFACE_CONSOLE).unwrap();
+    for id in ["ngl", "ctx", "threads", "parallel"] {
+        let node = tree.find(id).unwrap_or_else(|| panic!("缺参数框 {id}"));
+        assert!(
+            matches!(&node.body, NodeBody::NumberInput { report: Some(ReportMode::Commit), .. }),
+            "{id} 回车/失焦才上报"
+        );
+    }
+}
+
+#[test]
+fn console_offers_clipboard_copy_entries() {
+    let mut core = test_core();
+    core.host.start_line = "llama-server --model x".into();
+    let tree = build(&core, SURFACE_CONSOLE).unwrap();
+    for id in ["copycmd", "copyaddr"] {
+        let node = tree.find(id).unwrap_or_else(|| panic!("缺复制钮 {id}"));
+        assert!(node.events.contains(&EventKind::Click));
+    }
+}
+
+#[test]
+fn log_rows_use_mono_family() {
+    let mut core = test_core();
+    core.host.logs.push_back(crate::app::LogLine {
+        seq: 1,
+        time: "10:00:00".into(),
+        text: "hello".into(),
+        tone: crate::app::LogTone::Normal,
+        ansi: None,
+    });
+    let tree = build(&core, SURFACE_CONSOLE).unwrap();
+    let row = tree.find("log1").expect("日志行");
+    assert!(
+        matches!(&row.body, NodeBody::Text { family: Some(TextFamily::Mono), .. }),
+        "日志行等宽（终端样式）"
+    );
 }
 
 #[test]
@@ -165,8 +257,8 @@ fn console_filter_narrows_cards_without_renumbering_targets() {
     assert_eq!(visible, vec![1], "过滤只影响显示，卡片仍指向真实下标");
     let tree = build(&core, SURFACE_CONSOLE).unwrap();
     tree.validate().unwrap();
-    assert!(tree.find("pick1").is_some());
-    assert!(tree.find("pick0").is_none());
+    assert!(tree.find("fcard1").is_some());
+    assert!(tree.find("fcard0").is_none());
 }
 
 #[test]

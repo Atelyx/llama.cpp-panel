@@ -6,29 +6,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use atelyx_plugin_protocol::method::{
-    ContributionSlot, ProcessEventParams, ScrollEdge, ViewEventParams,
-};
-use atelyx_plugin_protocol::view::{EventValue, ViewEvent};
+use atelyx_plugin_protocol::method::{ContributionSlot, ProcessEventParams, ScrollEdge, ViewEventParams};
+use atelyx_plugin_protocol::layout::LayoutSpecNode;
+use atelyx_plugin_protocol::view::{Axis, ColorToken, EventValue, Key, KeyAction, NamedKey, ViewEvent};
 use atelyx_plugin_sdk::Context;
 use tokio::sync::{mpsc, watch};
 
 use crate::controller;
 use crate::download::{DownloadRequest, DownloadStatus, DownloadTask, Downloader};
 use crate::hf::{fetch_repo_detail, search_models, ModelSummary, RepoDetail, SearchSort};
+use crate::logfmt;
 use crate::modelscan::{group_by_folder, list_models, ModelFolder};
 use crate::probe::probe_once;
 use crate::settings::{self, LlamaSettings, ModelLaunchParams};
+use crate::tray;
 use crate::views;
 use crate::watcher::Watcher;
+
+/// 与 plugin.json 的 id 一致（默认布局的视图 kind 也按它拼）。
+pub const PLUGIN_ID: &str = "com.atelyx.llama-cpp-panel";
+/// 与 plugin.json 的 name 一致。
+pub const PLUGIN_NAME: &str = "llama.cpp 启动面板";
 
 /// 贡献点 id（宿主以它作 surfaceId；不得含 `:`）。
 pub const SURFACE_CONSOLE: &str = "console";
 pub const SURFACE_LIBRARY: &str = "library";
 pub const SURFACE_SETTINGS: &str = "settings";
 
-/// 日志缓冲的裁剪上限。
-pub const MAX_LOGS: usize = 300;
 /// 检索分页大小。
 const PAGE_LIMIT: u32 = 20;
 /// 检索累计取数上限（页数）：接口无游标、每次从头取满 limit，取数体积随页数线性增长。
@@ -51,12 +55,14 @@ pub enum LogTone {
 }
 
 pub struct LogLine {
-    /// 累计序号：环形淘汰后仍能唯一标识一行（视图按它复用控件态）。
+    /// 累计序号：覆盖刷新与清屏都不复用序号，视图按它作控件态键。
     pub seq: u64,
     /// 收到时刻（本地时区 HH:MM:SS；进程输出自带时间戳，插件行靠它对时）。
     pub time: String,
     pub text: String,
     pub tone: LogTone,
+    /// 行级 ANSI 主色（输出带转义且某前景色覆盖过半可见字符时生效）；None = 按 tone 规则着色。
+    pub ansi: Option<ColorToken>,
 }
 
 /// 运行状态（运行中/启动中/待命中/已停止/启动失败），由进程与待命字段推导。
@@ -69,6 +75,19 @@ pub enum RunPhase {
     Failed,
 }
 
+impl RunPhase {
+    /// 状态徽标与托盘条目共用的中文状态名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunPhase::Running => "运行中",
+            RunPhase::Starting => "启动中",
+            RunPhase::Watching => "待命中",
+            RunPhase::Failed => "启动失败",
+            RunPhase::Stopped => "已停止",
+        }
+    }
+}
+
 /// 进程托管状态（本插件启动与否）与日志。
 #[derive(Default)]
 pub struct HostState {
@@ -79,8 +98,10 @@ pub struct HostState {
     /// 展示将要执行的命令，便于用户确认。
     pub start_line: String,
     pub logs: VecDeque<LogLine>,
-    /// 日志累计行数（含被裁剪掉的）：界面感知新行靠它。
+    /// 日志累计行数（含被覆盖刷新掉的拍）：界面感知新行靠它。
     pub log_seq: u64,
+    /// 回刷中的逻辑行序号：`\r` 结尾的后续拍覆盖这一行，而不是新起一行。
+    pub pending: Option<u64>,
     /// 跟随最新（装配时开）：新日志落地后把列表滚到底；关闭后不打扰正在回看的用户。
     pub follow: bool,
     /// 已跟随滚动到的日志序号：与 `log_seq` 不等即有新行待滚。
@@ -99,6 +120,79 @@ pub struct HostState {
     pub watch_paused: bool,
     /// 每轮暂缓最多提示一次。
     pub watch_pause_notified: bool,
+}
+
+impl HostState {
+    /// 追加一行日志（领累计序号）。
+    fn push_line(&mut self, text: String, tone: LogTone, ansi: Option<ColorToken>) {
+        self.log_seq += 1;
+        self.logs.push_back(LogLine { seq: self.log_seq, time: chrono_secs(), text, tone, ansi });
+    }
+
+    /// 覆盖末行（序号对得上才是待命行：插件状态行插在中间时覆盖失效，调用方改走新行）。
+    fn overwrite_back(&mut self, seq: u64, text: String, tone: LogTone, ansi: Option<ColorToken>) -> bool {
+        match self.logs.back_mut().filter(|line| line.seq == seq) {
+            Some(line) => {
+                line.text = text;
+                line.time = chrono_secs();
+                line.tone = tone;
+                line.ansi = ansi;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 落地一条进程输出（宿主按行切好，行尾 `\n` 或 `\r`）。
+    ///
+    /// `\r` 是回刷新屏：首拍建行、后续拍覆盖同一逻辑行（终端行为），模型加载进度
+    /// 不把日志刷爆；`\n` 完结一行。插件自身状态行插在中间时下一拍找不到原行，
+    /// 自然落成新行（进度重新起行）。返回 false = 该段不产生可见行。
+    fn push_output(&mut self, stderr: bool, data: &str) -> bool {
+        let event = logfmt::classify(data);
+        let text = match &event {
+            logfmt::OutputEvent::Line(text) | logfmt::OutputEvent::Refresh(text) => *text,
+        };
+        if text.trim().is_empty() {
+            // 空白段不占额度；CRLF 拆出的后半个空行收掉待命行，进度行到此完结
+            if matches!(event, logfmt::OutputEvent::Line(_)) {
+                self.pending = None;
+            }
+            return false;
+        }
+        let (clean, ansi) = logfmt::strip_ansi(text);
+        let clean = logfmt::truncate(&clean, logfmt::OUTPUT_LINE_MAX);
+        let tone = if stderr { logfmt::stderr_tone(&clean) } else { LogTone::Normal };
+        if stderr {
+            self.last_stderr = clean.trim().to_string();
+        }
+        let text = if stderr { format!("! {clean}") } else { clean };
+        match event {
+            logfmt::OutputEvent::Refresh(_) => {
+                // 待命行还在末位即覆盖；被插件状态行挤走则新起一行（进度重新起行）
+                let at_back = self
+                    .pending
+                    .is_some_and(|seq| self.logs.back().is_some_and(|line| line.seq == seq));
+                if at_back {
+                    self.overwrite_back(self.pending.unwrap(), text, tone, ansi);
+                } else {
+                    self.push_line(text, tone, ansi);
+                    self.pending = Some(self.log_seq);
+                }
+            }
+            logfmt::OutputEvent::Line(_) => {
+                // `\r` 后的文本覆盖该行（终端语义，鲜见）；没有待命行即独立新行
+                let seq = self.pending.take();
+                let at_back = seq.is_some_and(|seq| self.logs.back().is_some_and(|line| line.seq == seq));
+                if at_back {
+                    self.overwrite_back(seq.unwrap(), text, tone, ansi);
+                } else {
+                    self.push_line(text, tone, ansi);
+                }
+            }
+        }
+        true
+    }
 }
 
 /// 模型库视图状态（检索 / 详情 / 下载入口）。
@@ -213,6 +307,10 @@ pub struct Core {
     pub scan: ScanState,
     /// 下载任务快照（模型库视图的下载卡）。
     pub dl: DownloadTask,
+    /// 托盘条目是否可用：平台不支持（非 Windows）时置假，之后不再提交。
+    pub tray_supported: bool,
+    /// 已提交的托盘条目签名：只在状态变化时整发整换，不按拍重提。
+    pub tray_signature: String,
 }
 
 impl Core {
@@ -271,17 +369,20 @@ impl App {
         let _ = self.version.send(next);
     }
 
-    /// 追加一行日志（领累计序号）并裁剪到上限。
+    /// 追加一行插件自身状态行（进程输出走 [`App::log_output`]）。
     pub fn log_line(&self, text: String, tone: LogTone) {
-        let time = chrono_secs();
         {
             let mut core = self.core();
-            let host = core.host_mut();
-            host.log_seq += 1;
-            host.logs.push_back(LogLine { seq: host.log_seq, time, text, tone });
-            while host.logs.len() > MAX_LOGS {
-                host.logs.pop_front();
-            }
+            core.host_mut().push_line(text, tone, None);
+        }
+        self.invalidate();
+    }
+
+    /// 落地一条进程输出（stderr 行按 llama-server 行头定级别并记最后错误输出）。
+    pub fn log_output(&self, stderr: bool, data: &str) {
+        {
+            let mut core = self.core();
+            core.host_mut().push_output(stderr, data);
         }
         self.invalidate();
     }
@@ -321,6 +422,7 @@ impl App {
             let mut core = self.core();
             let host = core.host_mut();
             host.logs.clear();
+            host.pending = None;
             host.scrolled_seq = host.log_seq;
         }
         self.invalidate();
@@ -373,6 +475,8 @@ pub fn build_app(ctx: Context, settings: LlamaSettings) -> Arc<App> {
                 lib: LibraryState::default(),
                 scan: ScanState::default(),
                 dl: DownloadTask::idle(),
+                tray_supported: true,
+                tray_signature: String::new(),
             }),
             version: watch::channel(0).0,
             downloader: Arc::new(Downloader::new(notify)),
@@ -386,7 +490,7 @@ pub fn build_app(ctx: Context, settings: LlamaSettings) -> Arc<App> {
     })
 }
 
-/// 装配后的一次性启动：贡献注册、渲染循环、探测轮询与首扫。
+/// 装配后的一次性启动：贡献注册、默认布局声明、渲染循环、探测轮询、托盘与首扫。
 pub async fn initialize(app: &Arc<App>) {
     // 图标名只能取宿主图标形状表里的现有名字：未知名字宿主不报错，静默回落拼图图标
     let contributions = [
@@ -399,6 +503,7 @@ pub async fn initialize(app: &Arc<App>) {
             eprintln!("贡献注册失败（{label}）：{err}");
         }
     }
+    declare_default_layout(app).await;
     for surface in [SURFACE_CONSOLE, SURFACE_LIBRARY, SURFACE_SETTINGS] {
         let build_app = Arc::clone(app);
         let build_surface = surface.to_string();
@@ -413,6 +518,7 @@ pub async fn initialize(app: &Arc<App>) {
     tokio::spawn(render_loop(Arc::clone(app)));
     tokio::spawn(process_consumer(Arc::clone(app)));
     tokio::spawn(probe_loop(Arc::clone(app)));
+    tray::spawn(app);
     // 首次探测出结果后做一次待命裁决：加载期若服务本就未运行，探测结果无变化、
     // 不会产生状态事件，必须显式裁决一次才会进入待命
     let probe_app = Arc::clone(app);
@@ -425,6 +531,23 @@ pub async fn initialize(app: &Arc<App>) {
     if !app.core().settings.models_dir.is_empty() {
         let app = Arc::clone(app);
         tokio::spawn(async move { scan_models(&app).await });
+    }
+}
+
+/// 声明默认布局：首次启用把两面板摆进当前场景——左控制台 40%、右模型商店 60%。
+/// 宿主只摆一次（记账），用户改名 / 删除后不补回；场景已含任一视图时只记账不新建。
+async fn declare_default_layout(app: &Arc<App>) {
+    let view_kind = |surface: &str| format!("plugin:{PLUGIN_ID}:{surface}");
+    let spec = LayoutSpecNode::Split {
+        direction: Axis::Horizontal,
+        children: vec![
+            LayoutSpecNode::Panel { views: vec![view_kind(SURFACE_CONSOLE)] },
+            LayoutSpecNode::Panel { views: vec![view_kind(SURFACE_LIBRARY)] },
+        ],
+        sizes: vec![40.0, 60.0],
+    };
+    if let Err(err) = app.ctx.declare_default_layout("llama.cpp 面板", spec).await {
+        eprintln!("默认布局声明失败：{err}");
     }
 }
 
@@ -690,12 +813,43 @@ async fn library_event(app: &Arc<App>, node: &str, event: &ViewEvent) {
         "dlpause" => app.downloader.cancel(),
         "dldismiss" => app.downloader.dismiss(),
         other => {
-            // 检索结果行（r{i}）与详情文件行（f{i}）：下标编码在节点 id 里
-            if let Some(index) = other.strip_prefix('r').and_then(|n| n.parse::<usize>().ok()) {
+            // 检索结果卡（rcard{i}）与详情文件行（frow{i} / f{i}）：下标编码在节点 id 里
+            if let Some(index) = other.strip_prefix("frow").and_then(|n| n.parse::<usize>().ok()) {
+                // 文件行整行可聚焦：右键或回车/空格即下载，与行内下载钮同一动作
+                if triggers_download(event) {
+                    download_detail_file(app, index, false).await;
+                }
+            } else if let Some(index) = other.strip_prefix("rcard").and_then(|n| n.parse::<usize>().ok()) {
                 open_detail(app, index).await;
             } else if let Some(index) = other.strip_prefix('f').and_then(|n| n.parse::<usize>().ok()) {
                 download_detail_file(app, index, false).await;
             }
+        }
+    }
+}
+
+/// 文件行的键盘 / 右键是否触发下载：回车或空格按下、或右键。
+fn triggers_download(event: &ViewEvent) -> bool {
+    match event {
+        ViewEvent::SecondaryClick => true,
+        ViewEvent::Key { key, action, .. } => {
+            matches!(action, KeyAction::Press)
+                && matches!(key, Key::Named { name: NamedKey::Enter | NamedKey::Space })
+        }
+        _ => false,
+    }
+}
+
+/// 复制到剪贴板：剪贴板没有界面反馈，成败各落一行日志（失败同时留 stderr 原因）。
+async fn copy_text(app: &Arc<App>, text: String, what: &str) {
+    if text.is_empty() {
+        return;
+    }
+    match app.ctx.clipboard_write(&text).await {
+        Ok(()) => app.log_status(format!("已复制{what}")),
+        Err(err) => {
+            eprintln!("复制{what}失败：{err}");
+            app.log_line(format!("复制{what}失败：{err}"), LogTone::Error);
         }
     }
 }
@@ -1004,6 +1158,14 @@ async fn console_event(app: &Arc<App>, node: &str, event: &ViewEvent) {
             }
         }
         "clear" => app.clear_logs(),
+        "copycmd" => {
+            let line = app.core().host.start_line.clone();
+            copy_text(app, line, "启动命令").await;
+        }
+        "copyaddr" => {
+            let url = settings::base_url(&app.core().settings);
+            copy_text(app, url, "服务地址").await;
+        }
         "filter" => {
             if let Some(text) = as_text(&event_value_of(event)) {
                 // 过滤只在本次会话生效：不落盘，也不触发取数
@@ -1097,8 +1259,8 @@ async fn console_event(app: &Arc<App>, node: &str, event: &ViewEvent) {
             }
         }
         other => {
-            // 模型卡片标题（pick{i}）：`i` 即 folders 里的真实下标（界面按真实下标编码，过滤只影响显示）
-            if let Some(index) = other.strip_prefix("pick").and_then(|n| n.parse::<usize>().ok()) {
+            // 模型卡片（fcard{i}）整卡可点选中：`i` 即 folders 里的真实下标（过滤只影响显示）
+            if let Some(index) = other.strip_prefix("fcard").and_then(|n| n.parse::<usize>().ok()) {
                 select_folder(app, index).await;
             }
         }
@@ -1250,5 +1412,56 @@ mod tests {
         assert_eq!(parse_opt_u32(&EventValue::Number(8.0), 1), Some(8));
         assert_eq!(parse_opt_u32(&EventValue::Number(0.0), 1), None, "越出下限不传");
         assert_eq!(parse_opt_u32(&EventValue::Text(String::new()), 1), None);
+    }
+
+    #[test]
+    fn carriage_return_refreshes_one_log_line() {
+        let mut host = HostState::default();
+        assert!(host.push_output(false, "load model 10%\r"));
+        assert!(host.push_output(false, "load model 90%\r"));
+        assert_eq!(host.logs.len(), 1, "连续 \\r 只占一行");
+        assert_eq!(host.logs[0].text, "load model 90%");
+        assert!(host.pending.is_some());
+        // CRLF 的后半段收掉待命行：进度行完结，不额外占行
+        assert!(!host.push_output(false, "\n"));
+        assert!(host.pending.is_none());
+        assert_eq!(host.logs.len(), 1);
+        assert!(host.push_output(false, "server started\n"));
+        assert_eq!(host.logs.len(), 2, "完结后的输出是新行");
+    }
+
+    #[test]
+    fn newline_and_blank_segments() {
+        let mut host = HostState::default();
+        assert!(!host.push_output(false, "\n"), "空白行不占额度");
+        assert!(host.logs.is_empty());
+        assert!(!host.push_output(false, "   \r"), "纯空白回刷拍同样跳过");
+        assert!(host.pending.is_none(), "空白拍不建待命行");
+        assert!(host.push_output(false, "hello"));
+        assert_eq!(host.logs.len(), 1, "EOF 末段按完结行落地");
+    }
+
+    #[test]
+    fn status_line_between_refresh_beats_starts_new_progress_line() {
+        let mut host = HostState::default();
+        assert!(host.push_output(false, "load 10%\r"));
+        let seq = host.pending.unwrap();
+        host.push_line("插件状态行".into(), LogTone::Normal, None);
+        assert!(host.push_output(false, "load 90%\r"));
+        assert_eq!(host.logs.len(), 3, "状态行插在中间：覆盖失效，进度重新起行");
+        assert_eq!(host.logs[0].seq, seq, "原进度行保持原位");
+        assert_eq!(host.logs[2].text, "load 90%");
+    }
+
+    #[test]
+    fn stderr_output_gets_prefix_tone_and_ansi_color() {
+        let mut host = HostState::default();
+        assert!(host.push_output(true, "10:00:00 E main: boom\n"));
+        assert_eq!(host.logs[0].tone, LogTone::Error);
+        assert_eq!(host.logs[0].text, "! 10:00:00 E main: boom");
+        assert_eq!(host.last_stderr, "10:00:00 E main: boom");
+        assert!(host.push_output(false, "\u{1b}[32mready\u{1b}[0m\n"));
+        assert_eq!(host.logs[1].text, "ready", "转义被剥掉");
+        assert_eq!(host.logs[1].ansi, Some(ColorToken::Success));
     }
 }

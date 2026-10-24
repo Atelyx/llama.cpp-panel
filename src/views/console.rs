@@ -3,12 +3,11 @@
 //! 宿主把两个填充子项恒均分（`max_width` 对填充子项无效），故比例只能 50/50，日志区另给固定高度。
 
 use atelyx_plugin_protocol::view::{
-    ButtonVariant, CardTone, ColorToken, EventKind, NodeBody, TextWeight, ViewNode,
+    ButtonVariant, CardTone, ColorToken, EventKind, NodeBody, TextFamily, TextWeight, ViewNode,
 };
 
 use super::*;
-use atelyx_plugin_protocol::view::ReportMode;
-use crate::app::{selected_folder_index, Core, LogLine, LogTone, RunPhase, SURFACE_CONSOLE, MAX_LOGS};
+use crate::app::{selected_folder_index, Core, LogLine, LogTone, RunPhase, SURFACE_CONSOLE};
 use crate::modelscan::{file_name_of, ModelFolder};
 use crate::settings::{normalize_dir, params_for};
 
@@ -23,17 +22,27 @@ pub fn console(core: &Core) -> ViewNode {
     children.push(node("logs-div", NodeBody::Divider {}));
     children.push(logs_head(core));
     if !core.host.start_line.is_empty() {
-        children.push(field_row(
+        // 命令预览标签行带复制钮：剪贴板没有界面反馈之外的一键入口
+        children.push(column_gap(
             "logs-cmd-field",
-            "启动命令",
-            read_only_field("logs-cmd", core.host.start_line.clone()),
+            4.0,
+            vec![
+                spread_row(
+                    "logs-cmd-label-row",
+                    vec![
+                        field_label("logs-cmd-field", "启动命令"),
+                        icon_button("copycmd", "copy", "复制启动命令", true, vec![EventKind::Click]),
+                    ],
+                ),
+                read_only_field("logs-cmd", core.host.start_line.clone()),
+            ],
         ));
     }
     children.push(logs_body(core));
     panel_root(SURFACE_CONSOLE, children)
 }
 
-/// 状态条：名称 + 运行/连接徽标 + 服务地址，右端启停。
+/// 状态条：名称 + 运行/连接徽标 + 服务地址（附复制钮），右端启停。
 fn top_bar(core: &Core) -> ViewNode {
     let phase = core.run_phase();
     let (run_label, run_color) = run_status(phase);
@@ -50,6 +59,7 @@ fn top_bar(core: &Core) -> ViewNode {
             chip("run-state", run_label, run_color),
             chip("conn-state", conn_label, conn_color),
             text_muted("top-addr", service_addr(core)),
+            icon_button("copyaddr", "copy", "复制服务地址", true, vec![EventKind::Click]),
         ],
     );
     let right = row(
@@ -63,13 +73,14 @@ fn top_bar(core: &Core) -> ViewNode {
 }
 
 fn run_status(phase: RunPhase) -> (&'static str, ColorToken) {
-    match phase {
-        RunPhase::Running => ("运行中", ColorToken::Success),
-        RunPhase::Starting => ("启动中", ColorToken::Warning),
-        RunPhase::Watching => ("待命中", ColorToken::Accent),
-        RunPhase::Failed => ("启动失败", ColorToken::Danger),
-        RunPhase::Stopped => ("已停止", ColorToken::TextSecondary),
-    }
+    let color = match phase {
+        RunPhase::Running => ColorToken::Success,
+        RunPhase::Starting => ColorToken::Warning,
+        RunPhase::Watching => ColorToken::Accent,
+        RunPhase::Failed => ColorToken::Danger,
+        RunPhase::Stopped => ColorToken::TextSecondary,
+    };
+    (phase.label(), color)
 }
 
 /// 服务地址（监听地址留空按本机回环展示）。
@@ -119,7 +130,7 @@ fn models_tools(core: &Core) -> ViewNode {
                 if visible.is_empty() { ColorToken::TextMuted } else { ColorToken::Accent },
             ),
             text_input("filter", core.scan.filter.clone(), "按名称过滤", ReportMode::Debounced(300), vec![EventKind::Change]),
-            icon_button("rescan", "refresh-cw", "重新扫描", !core.scan.scanning, false, vec![EventKind::Click]),
+            icon_button("rescan", "refresh-cw", "重新扫描", !core.scan.scanning, vec![EventKind::Click]),
             button(
                 "clearsel",
                 "清除选择",
@@ -152,7 +163,7 @@ fn models_pane(core: &Core) -> ViewNode {
     list("models-list", 6.0, cards)
 }
 
-/// 模型卡片：名称钮选中该文件夹，摘要行给量化/投影数量与总体积。
+/// 模型卡片：整卡可点选中，摘要行给量化/投影数量与总体积。
 /// 下标是 `folders` 里的真实下标（事件路由按它定位，过滤只影响显示）。
 fn folder_card(index: usize, folder: &ModelFolder, selected_dir: Option<&str>) -> ViewNode {
     let selected = selected_dir.is_some_and(|dir| dir == normalize_dir(&folder.full));
@@ -161,12 +172,12 @@ fn folder_card(index: usize, folder: &ModelFolder, selected_dir: Option<&str>) -
         format!("fcard{index}"),
         selected,
         vec![
-            button(
-                format!("pick{index}"),
+            text_sized(
+                format!("fcard{index}-name"),
                 folder_name(&folder.rel),
-                ButtonVariant::Ghost,
-                true,
-                vec![EventKind::Click],
+                1.0,
+                TextWeight::Medium,
+                ColorToken::Text,
             ),
             spread_row(
                 format!("fmeta{index}"),
@@ -327,14 +338,14 @@ fn logs_head(core: &Core) -> ViewNode {
             section_head("logs-title", "日志"),
             chip(
                 "logs-count",
-                format!("{} / {} 行", core.host.logs.len(), MAX_LOGS),
+                format!("{} 行", core.host.logs.len()),
                 if core.host.logs.is_empty() { ColorToken::TextMuted } else { ColorToken::TextSecondary },
             ),
         ],
     );
     let mut right = vec![checkbox("follow", core.host.follow, "跟随最新", vec![EventKind::Change])];
     if !core.host.logs.is_empty() {
-        right.push(icon_button("clear", "eraser", "清空日志", true, false, vec![EventKind::Click]));
+        right.push(icon_button("clear", "eraser", "清空日志", true, vec![EventKind::Click]));
     }
     spread_row("logs-head", vec![left, row("logs-head-right", right)])
 }
@@ -348,20 +359,32 @@ fn logs_body(core: &Core) -> ViewNode {
     scroll_fixed("logs-scroll", LOG_AREA_HEIGHT, 2.0, lines)
 }
 
-/// 一行日志：时刻前缀 + 按级别着色的正文；键取累计序号（环形淘汰后下标会整体前移）。
+/// 一行日志：等宽族按位列对齐（终端样式），时刻前缀同色系。
+/// 取色优先级：级别 > ANSI 主色 > 「listening on」就绪行绿 > 正文；
+/// 行键取累计序号（覆盖刷新与清屏都不复用序号，控件态不错位）。
 fn log_row(line: &LogLine) -> ViewNode {
     let color = match line.tone {
         LogTone::Error => ColorToken::Danger,
         LogTone::Warn => ColorToken::Warning,
-        // 就绪信号行给绿色作为直观信号
-        LogTone::Normal if line.text.contains("listening on") => ColorToken::Success,
-        LogTone::Normal => ColorToken::Text,
+        LogTone::Normal => line.ansi.unwrap_or_else(|| {
+            if line.text.contains("listening on") {
+                ColorToken::Success
+            } else {
+                ColorToken::Text
+            }
+        }),
     };
-    text_sized(
+    node(
         format!("log{}", line.seq),
-        format!("[{}] {}", line.time, line.text),
-        SIZE_LOG,
-        TextWeight::Normal,
-        color,
+        NodeBody::Text {
+            content: format!("[{}] {}", line.time, line.text),
+            size: Some(SIZE_LOG),
+            weight: Some(TextWeight::Normal),
+            color: Some(ColorSpec::Token(color)),
+            align: None,
+            family: Some(TextFamily::Mono),
+            wrap: None,
+            max_lines: None,
+        },
     )
 }

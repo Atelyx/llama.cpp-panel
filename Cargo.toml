@@ -1,6 +1,6 @@
 [package]
 name = "llama-cpp-panel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Atelyx 的 llama.cpp 启动面板插件：检索下载 gguf 模型、托管启停 llama-server 并查看状态与日志"

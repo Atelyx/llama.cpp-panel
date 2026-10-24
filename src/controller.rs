@@ -12,6 +12,7 @@ use crate::app::{App, LogTone};
 use crate::launcher::{
     describe_start_command, find_server_executable, missing_executable_message, start_command,
 };
+use crate::logfmt;
 use crate::probe::probe_once;
 use crate::settings::LlamaSettings;
 
@@ -23,8 +24,6 @@ const READY_POLL: Duration = Duration::from_millis(1500);
 const HEARTBEAT: Duration = Duration::from_secs(5);
 /// 错误输出可能极长，进通知与快照前截断。
 const ERROR_DETAIL_MAX: usize = 200;
-/// 单行输出上限：进程可能吐出不换行的一大段，截断后不把大块文本塞进界面树。
-const OUTPUT_LINE_MAX: usize = 4096;
 
 /// 启动并等待服务就绪。返回 false 有两种含义——已有进程/正在启动、启动失败：后者写 error，前者不写。
 pub async fn start(app: &Arc<App>) -> bool {
@@ -189,6 +188,7 @@ pub async fn stop(app: &Arc<App>) {
 }
 
 /// 就绪判定用「接口通」而不是「日志出现某句话」：接口可用才是真的可用。
+/// 探测端点以 /health 为准（llama-server 加载期回 503、就绪回 200 且免鉴权）。
 async fn wait_ready(app: &Arc<App>) -> bool {
     let started = std::time::Instant::now();
     let mut last_heartbeat = started;
@@ -201,6 +201,7 @@ async fn wait_ready(app: &Arc<App>) -> bool {
         }
         let settings = app.core().settings.clone();
         if probe_once(&app.client, &settings).await {
+            app.log_status(format!("服务已就绪（{}s）", started.elapsed().as_secs()));
             return true;
         }
         if !app.core().host().died.is_empty() {
@@ -293,18 +294,10 @@ pub async fn on_process_event(app: &Arc<App>, params: ProcessEventParams) {
         return; // 上一代进程的迟到事件（已被停止/取代）一律忽略
     }
     match params.event {
-        ProcessEvent::Stdout { data } => {
-            if let Some(line) = output_line(&data) {
-                app.log_line(line, LogTone::Normal);
-            }
-        }
+        ProcessEvent::Stdout { data } => app.log_output(false, &data),
         ProcessEvent::Stderr { data } => {
-            // llama-server 把日志写 stderr：逐行定色，最后一条非空行就是最接近现场的失败信息
-            if let Some(line) = output_line(&data) {
-                let tone = stderr_tone(&line);
-                app.core().host_mut().last_stderr = line.trim().to_string();
-                app.log_line(format!("! {line}"), tone);
-            }
+            // llama-server 把日志写 stderr：行头定级别，最后一条非空行就是最接近现场的失败信息
+            app.log_output(true, &data);
         }
         ProcessEvent::Terminated { code } => {
             let line = {
@@ -315,7 +308,7 @@ pub async fn on_process_event(app: &Arc<App>, params: ProcessEventParams) {
                 let detail = if host.last_stderr.is_empty() {
                     String::new()
                 } else {
-                    format!("：{}", truncate(&host.last_stderr, ERROR_DETAIL_MAX))
+                    format!("：{}", logfmt::truncate(&host.last_stderr, ERROR_DETAIL_MAX))
                 };
                 let exit = match code {
                     Some(code) => format!("退出码 {code}"),
@@ -346,40 +339,6 @@ pub async fn on_process_event(app: &Arc<App>, params: ProcessEventParams) {
             app.invalidate();
             evaluate_watcher(app).await;
         }
-    }
-}
-
-/// 一条输出事件即为宿主按行切好的一行（含行尾符，`\n` 或 `\r`）：去掉行尾即整行。
-/// CRLF 由宿主拆成「…\r」与「\n」两条事件，后者的行尾去掉即为空——空白行不占日志额度。
-/// 超长（进程未换行的一整段）按上限截断，不把大块文本塞进界面树。
-fn output_line(data: &str) -> Option<String> {
-    let line = data.trim_end_matches(['\n', '\r']);
-    if line.trim().is_empty() {
-        return None;
-    }
-    Some(truncate(line, OUTPUT_LINE_MAX))
-}
-
-/// stderr 行着色：llama-server 把日志写 stderr，行头形如「时间戳 I|W|E 组件」；
-/// 解析不出级别的 stderr 行按警告处理——它至少值得注意。
-fn stderr_tone(line: &str) -> LogTone {
-    let body = line.trim_start();
-    let mut parts = body.split_whitespace();
-    let _timestamp = parts.next();
-    match parts.next() {
-        Some("E") => LogTone::Error,
-        Some("W") => LogTone::Warn,
-        Some("I" | "D") => LogTone::Normal,
-        _ => LogTone::Warn,
-    }
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        let cut: String = text.chars().take(max).collect();
-        format!("{cut}…")
     }
 }
 
@@ -479,8 +438,8 @@ async fn pause_auto_start(app: &Arc<App>, reason: String) {
 /// 外部调用触发：提示后复用普通启动流程。调用方 UA 只落日志（通知保持一行说清）。
 pub async fn handle_trigger(app: &Arc<App>, request_line: String, user_agent: String) {
     // 调用方来自本机任意进程，串长只受请求头解析上限约束：进日志与通知前先钳到一行
-    let request_line = truncate(&request_line, ERROR_DETAIL_MAX);
-    let user_agent = truncate(&user_agent, ERROR_DETAIL_MAX);
+    let request_line = logfmt::truncate(&request_line, ERROR_DETAIL_MAX);
+    let user_agent = logfmt::truncate(&user_agent, ERROR_DETAIL_MAX);
     if app.core().host().watch {
         let mut core = app.core();
         core.host_mut().watch = false;
@@ -547,7 +506,7 @@ pub fn watch_hooks(app: &Arc<App>) -> crate::watcher::WatchHooks {
         on_noise: Arc::new(move |line| {
             let app = Arc::clone(&noise_app);
             // 请求头来自外部连接、单条上限数十 KB，进日志前钳到一行
-            let line = truncate(&line, ERROR_DETAIL_MAX);
+            let line = logfmt::truncate(&line, ERROR_DETAIL_MAX);
             tokio::spawn(async move {
                 // 裁决排队/收尾窗口里可能已退出待命：此刻的噪音行不再属于「待命收到」
                 if app.core().host().watch {
@@ -555,27 +514,5 @@ pub fn watch_hooks(app: &Arc<App>) -> crate::watcher::WatchHooks {
                 }
             });
         }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn output_line_strips_host_line_terminator() {
-        assert_eq!(output_line("load\n").as_deref(), Some("load"));
-        assert_eq!(output_line("load\r").as_deref(), Some("load"));
-        assert_eq!(output_line("无行尾的尾段").as_deref(), Some("无行尾的尾段"));
-        assert_eq!(output_line("\n"), None, "CRLF 拆开的后半段不占一行");
-        assert_eq!(output_line("   \n"), None, "空白行不进日志");
-    }
-
-    #[test]
-    fn output_line_caps_runaway_line() {
-        let long = "x".repeat(OUTPUT_LINE_MAX + 10);
-        let line = output_line(&long).unwrap();
-        assert_eq!(line.chars().count(), OUTPUT_LINE_MAX + 1, "超限即截断并标记");
-        assert!(line.ends_with('…'));
     }
 }

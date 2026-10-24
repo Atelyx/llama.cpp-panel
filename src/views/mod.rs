@@ -7,8 +7,8 @@ mod library;
 mod settings;
 
 use atelyx_plugin_protocol::view::{
-    Align, BoxSize, ButtonVariant, CardTone, ColorSpec, ColorToken, ControlSize, EventKind, Justify,
-    NodeBody, PaddingSpec, ReportMode, SizeSpec, TextWeight, ViewNode,
+    Align, BoxSize, ButtonVariant, CardTone, ColorSpec, ColorToken, ControlSize, EventKind, Interaction,
+    InteractionState, Justify, NodeBody, PaddingSpec, ReportMode, SizeSpec, Surface, TextWeight, ViewNode,
 };
 
 use crate::app::{Core, SURFACE_CONSOLE, SURFACE_LIBRARY, SURFACE_SETTINGS};
@@ -136,10 +136,29 @@ fn card_box(
     )
 }
 
-/// 列表行卡片：未选中走次级底，选中走强条底 + 强调边框。
+/// 可点卡片：整卡承接点击（调用方按卡片 id 路由），名称等子节点不再自带按钮。
+/// 悬停给反馈底；选中走激活档（激活优先于悬停，选中态不因悬停丢失）。
+/// 未选中且未悬停时不声明任何命中档，卡片照自身 tone / 边框绘制。
 fn row_card(id: impl Into<String>, selected: bool, children: Vec<ViewNode>) -> ViewNode {
-    let tone = if selected { CardTone::AccentSoft } else { CardTone::Muted };
-    card_box(id, selected, tone, 10.0, children)
+    let mut card = card_box(id, selected, if selected { CardTone::AccentSoft } else { CardTone::Muted }, 10.0, children);
+    card.events = vec![EventKind::Click];
+    card.interaction = Some(Interaction {
+        state: Some(if selected { InteractionState::Active } else { InteractionState::Normal }),
+        normal: None,
+        hover: Some(Surface {
+            background: Some(ColorSpec::Token(ColorToken::Hover)),
+            border: Some(ColorSpec::Token(ColorToken::Border)),
+            radius: Some(8.0),
+        }),
+        focused: None,
+        active: Some(Surface {
+            background: Some(ColorSpec::Token(ColorToken::AccentSoft)),
+            border: Some(ColorSpec::Token(ColorToken::Accent)),
+            radius: Some(8.0),
+        }),
+        disabled: None,
+    });
+    card
 }
 
 /// 徽标：收缩卡片里的小号加粗文字，用来标注计数与状态。
@@ -234,6 +253,7 @@ fn text_sized(
             align: None,
             family: None,
             wrap: None,
+            max_lines: None,
         },
     )
 }
@@ -267,7 +287,8 @@ fn text_tone(id: impl Into<String>, content: impl Into<String>, color: ColorToke
 
 /// 占满剩余宽度的文字行：宿主只在声明 `align` 时把文本铺到父宽，
 /// 未声明则按内容收缩——长内容会把同行右端的控件顶出可视区。
-fn text_fill(id: impl Into<String>, content: impl Into<String>, color: ColorToken) -> ViewNode {
+/// `max_lines` 限制渲染行数（超出按实际排版补省略号，长文件名不把行撑高）。
+fn text_fill(id: impl Into<String>, content: impl Into<String>, color: ColorToken, max_lines: Option<u32>) -> ViewNode {
     node(
         id,
         NodeBody::Text {
@@ -278,6 +299,7 @@ fn text_fill(id: impl Into<String>, content: impl Into<String>, color: ColorToke
             align: Some(Align::Start),
             family: None,
             wrap: None,
+            max_lines,
         },
     )
 }
@@ -339,13 +361,12 @@ fn button_sized(
     n
 }
 
-/// 图标钮：`hover_only` 时未悬停也占位（列表行布局不跳）。
+/// 图标钮（常显：列表行的操作入口不依赖悬停，触摸设备才有落点）。
 fn icon_button(
     id: impl Into<String>,
     icon: &str,
     tooltip: &str,
     enabled: bool,
-    hover_only: bool,
     events: Vec<EventKind>,
 ) -> ViewNode {
     let mut n = node(
@@ -356,11 +377,32 @@ fn icon_button(
             enabled: Some(enabled),
             size: None,
             variant: None,
-            hover_only: hover_only.then_some(true),
+            hover_only: None,
         },
     );
     n.events = events;
     n
+}
+
+/// 焦点框：可聚焦节点（声明 key/focus）持焦点时的强调色描边，键盘用户据此看见当前目标。
+fn focus_border() -> Interaction {
+    Interaction {
+        state: None,
+        normal: None,
+        hover: None,
+        focused: Some(Surface {
+            background: None,
+            border: Some(ColorSpec::Token(ColorToken::Accent)),
+            radius: Some(6.0),
+        }),
+        active: None,
+        disabled: None,
+    }
+}
+
+fn with_interaction(mut node: ViewNode, interaction: Interaction) -> ViewNode {
+    node.interaction = Some(interaction);
+    node
 }
 
 fn text_input(
@@ -427,7 +469,8 @@ fn number_input_max(
             step: Some(1.0),
             placeholder: (!placeholder.is_empty()).then(|| placeholder.to_string()),
             read_only: None,
-            report: None,
+            // 回车 / 失焦才上报：敲字过程由宿主本地持有，不逐键存设置与重绘
+            report: Some(ReportMode::Commit),
         },
     );
     n.events = events;
