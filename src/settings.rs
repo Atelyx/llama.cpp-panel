@@ -29,6 +29,8 @@ pub struct ModelLaunchParams {
     pub no_webui: bool,
     /// 模型载入模式（--load-mode）；空 = 不传。
     pub load_mode: String,
+    /// API 密钥（--api-key）；空 = 不启用。连接探测按它自动携带，避免把密钥混进附加参数。
+    pub api_key: String,
     /// 其余附加参数，原样追加在末尾。
     pub extra_args: String,
 }
@@ -112,24 +114,33 @@ impl LlamaSettings {
     }
 }
 
-/// 读取设置：缺失或损坏一律回落默认，不报错（启用插件不该被脏状态挡住）。
-pub async fn load(ctx: &atelyx_plugin_sdk::Context) -> LlamaSettings {
+/// 读取设置。返回（设置，读取是否成功）：
+/// - 读取成功但形状不认识（手改或半写）：按默认值起用（不把半截状态带偏），照常可写回；
+/// - 能力面读取失败：按默认值起用且返回 `false`，调用方应暂停落盘，
+///   防止以默认值覆盖磁盘上尚好的设置。
+pub async fn load(ctx: &atelyx_plugin_sdk::Context) -> (LlamaSettings, bool) {
     match ctx.state_read().await {
-        Ok(value) => serde_json::from_value::<PluginState>(value)
-            .ok()
-            .and_then(|state| state.settings)
-            .map(LlamaSettings::sanitize)
-            .unwrap_or_default(),
-        Err(_) => LlamaSettings::default(),
+        Ok(value) => match serde_json::from_value::<PluginState>(value) {
+            Ok(state) => (state.settings.map(LlamaSettings::sanitize).unwrap_or_default(), true),
+            Err(err) => {
+                eprintln!("设置形状无法识别，按默认值起用：{err}");
+                (LlamaSettings::default(), true)
+            }
+        },
+        Err(err) => {
+            eprintln!("读取设置失败，按默认值起用：{err}");
+            (LlamaSettings::default(), false)
+        }
     }
 }
 
-/// 整体覆盖写入。
-pub async fn save(ctx: &atelyx_plugin_sdk::Context, settings: &LlamaSettings) {
+/// 整体覆盖写入。失败返回可读原因（能力面故障时磁盘可能仍是旧值，调用方须给可见提示）。
+pub async fn save(ctx: &atelyx_plugin_sdk::Context, settings: &LlamaSettings) -> Result<(), String> {
     let payload = PluginState { version: STATE_VERSION, settings: Some(settings.clone()) };
-    if let Ok(value) = serde_json::to_value(&payload) {
-        let _ = ctx.state_write(value).await;
-    }
+    let value = serde_json::to_value(&payload).map_err(|err| format!("设置序列化失败：{err}"))?;
+    ctx.state_write(value)
+        .await
+        .map_err(|err| format!("设置落盘失败：{err}（本次变更可能没有保存）"))
 }
 
 /// 拼 HTTP 基址（末尾不带斜杠）。监听 0.0.0.0（局域网可调 API）时探测走本机回环；

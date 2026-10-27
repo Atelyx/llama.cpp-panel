@@ -150,6 +150,11 @@ pub fn build_start_tokens(settings: &LlamaSettings, server_exe: &str) -> Result<
         tokens.push("--load-mode".into());
         tokens.push(params.load_mode.clone());
     }
+    let api_key = params.api_key.trim();
+    if !api_key.is_empty() {
+        tokens.push("--api-key".into());
+        tokens.push(api_key.to_string());
+    }
     tokens.extend(split_args(&params.extra_args));
     Ok(tokens)
 }
@@ -210,6 +215,7 @@ mod tests {
             jinja: true,
             no_webui: true,
             load_mode: "mmap".into(),
+            api_key: "sk-test".into(),
             extra_args: "  --verbose  --api-key \"abc def\" ".into(),
         };
         let settings = settings_with("C:/models/q/m.gguf", params);
@@ -229,6 +235,7 @@ mod tests {
                 "--jinja",
                 "--no-webui",
                 "--load-mode", "mmap",
+                "--api-key", "sk-test",
                 "--verbose",
                 "--api-key", "abc def",
             ]

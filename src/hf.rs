@@ -192,6 +192,22 @@ pub async fn fetch_repo_detail(
     Ok(RepoDetail { summary, files, readme, gated })
 }
 
+/// 模型卡正文处理：剥 BOM、行尾归一为 LF、去 YAML front matter（许可证等元数据不参与展示）。
+fn normalize_readme(text: &str) -> String {
+    let text = text
+        .trim_start_matches('\u{FEFF}')
+        // 行尾归一为 LF
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    match text.strip_prefix("---\n") {
+        Some(rest) => match rest.find("\n---") {
+            Some(end) => rest[end + 4..].trim_start_matches('\n').to_string(),
+            None => text,
+        },
+        None => text,
+    }
+}
+
 /// 取模型卡简介。取不到不算失败——简介是附加信息，不该挡住文件清单。
 async fn fetch_readme(client: &reqwest::Client, mirror: MirrorSource, repo: &str) -> String {
     let url = readme_url(mirror, repo, "main");
@@ -202,19 +218,44 @@ async fn fetch_readme(client: &reqwest::Client, mirror: MirrorSource, repo: &str
     if fetched.truncated {
         text.push_str("\n\n（内容过长，已截断）");
     }
-    let text = text
-        .trim_start_matches('\u{FEFF}')
-        // 行尾归一为 LF
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
-    // YAML front matter（许可证、语言等元数据）不是正文，不参与展示
-    match text.strip_prefix("---\n") {
-        Some(rest) => match rest.find("\n---") {
-            Some(end) => rest[end + 4..].trim_start_matches('\n').to_string(),
-            None => text,
-        },
-        None => text,
+    normalize_readme(&text)
+}
+
+/// 识别分片文件名：形如 `xxx-00001-of-00004.gguf`（大小写不敏感），
+/// 返回（公共前缀、声明的总段数）；不匹配返回 None。
+fn shard_parts(name: &str) -> Option<(String, String)> {
+    let lower = name.to_lowercase();
+    let stem = lower.strip_suffix(".gguf")?;
+    let (head, total) = stem.rsplit_once("-of-")?;
+    if total.is_empty() || !total.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    let (prefix, index) = head.rsplit_once('-')?;
+    if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((prefix.to_string(), total.to_string()))
+}
+
+/// 仓库文件清单里的分片组：公共前缀与声明总段数都相同的 ≥2 个分片归为一组，
+/// 返回（前缀、组内文件下标，升序）。大模型普遍分片发布，整组下载免逐个手点。
+pub fn shard_groups(files: &[RepoFile]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, String, Vec<usize>)> = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        let Some((prefix, total)) = shard_parts(&file.name) else { continue };
+        match groups.iter_mut().find(|(p, t, _)| *p == prefix && *t == total) {
+            Some((_, _, indexes)) => indexes.push(index),
+            None => groups.push((prefix, total, vec![index])),
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|(_, _, indexes)| indexes.len() >= 2)
+        .map(|(prefix, _, mut indexes)| {
+            indexes.sort_unstable();
+            (prefix, indexes)
+        })
+        .collect()
 }
 
 /// 探取下载地址对应的真实文件大小；拿不到返回 None——体积只用于显示百分比，不是下载的前置条件。
@@ -257,16 +298,35 @@ mod tests {
 
     #[test]
     fn readme_strips_front_matter_and_normalizes_crlf() {
-        // front matter 剥离逻辑与 fetch_readme 内联实现共用同一段口径，这里直接测数据面
-        let text = "---\nlicense: mit\r\n---\r\n# Hello\r\nworld";
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        let stripped = match normalized.strip_prefix("---\n") {
-            Some(rest) => match rest.find("\n---") {
-                Some(end) => rest[end + 4..].trim_start_matches('\n').to_string(),
-                None => normalized,
-            },
-            None => normalized,
+        assert_eq!(normalize_readme("---\nlicense: mit\r\n---\r\n# Hello\r\nworld"), "# Hello\nworld");
+        assert_eq!(normalize_readme("没有 front matter"), "没有 front matter");
+        assert_eq!(normalize_readme("\u{FEFF}带 BOM"), "带 BOM");
+    }
+
+    #[test]
+    fn shard_groups_require_two_and_shared_prefix() {
+        let files = |names: &[&str]| -> Vec<RepoFile> {
+            names.iter().map(|name| RepoFile { name: name.to_string(), size: Some(1) }).collect()
         };
-        assert_eq!(stripped, "# Hello\nworld");
+        let grouped = shard_groups(&files(&[
+            "Qwen2.5-7B-00001-of-00003.gguf",
+            "Qwen2.5-7B-00002-of-00003.gguf",
+            "Qwen2.5-7B-00003-of-00003.gguf",
+            "mmproj-F16.gguf",
+            "Other-00001-of-00003.gguf",
+        ]));
+        assert_eq!(grouped.len(), 1, "其他仓库同名段数不成组，单文件不成组");
+        assert_eq!(grouped[0].0, "qwen2.5-7b");
+        assert_eq!(grouped[0].1, vec![0, 1, 2]);
+
+        // 大小写混排与子目录路径同样按文件名识别
+        let mixed = shard_groups(&files(&["sub/A-00001-OF-00002.GGUF", "sub/a-00002-of-00002.gguf"]));
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].1, vec![0, 1]);
+
+        // 同前缀但声明总段数不同（截断的分片）不算一组
+        assert!(shard_groups(&files(&["a-00001-of-00002.gguf", "a-00001-of-00003.gguf"])).is_empty());
+        // 单文件不成组
+        assert!(shard_groups(&files(&["a-00001-of-00002.gguf"])).is_empty());
     }
 }

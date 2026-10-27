@@ -66,6 +66,7 @@ fn top_bar(core: &Core) -> ViewNode {
         "top-right",
         vec![
             button_md("start", "启动", ButtonVariant::Primary, !busy, vec![EventKind::Click]),
+            button_md("restart", "重启", ButtonVariant::Ghost, matches!(phase, RunPhase::Running), vec![EventKind::Click]),
             button_md("stop", "停止", ButtonVariant::Danger, busy, vec![EventKind::Click]),
         ],
     );
@@ -75,7 +76,7 @@ fn top_bar(core: &Core) -> ViewNode {
 fn run_status(phase: RunPhase) -> (&'static str, ColorToken) {
     let color = match phase {
         RunPhase::Running => ColorToken::Success,
-        RunPhase::Starting => ColorToken::Warning,
+        RunPhase::Starting | RunPhase::Exited => ColorToken::Warning,
         RunPhase::Watching => ColorToken::Accent,
         RunPhase::Failed => ColorToken::Danger,
         RunPhase::Stopped => ColorToken::TextSecondary,
@@ -310,6 +311,11 @@ fn params_body(core: &Core, folder: &ModelFolder) -> Vec<ViewNode> {
             ],
         ),
         field_row(
+            "apikey-field",
+            "API 密钥（--api-key）",
+            secret_input("apikey", params.api_key.clone(), "留空不启用"),
+        ),
+        field_row(
             "extra-field",
             "附加参数（空格分隔，含空格的参数用引号包裹）",
             text_input("extra", params.extra_args.clone(), "追加在命令末尾", ReportMode::Commit, vec![EventKind::Change]),
@@ -350,13 +356,14 @@ fn logs_head(core: &Core) -> ViewNode {
     spread_row("logs-head", vec![left, row("logs-head-right", right)])
 }
 
-/// 日志区：固定高度滚动；无日志给空态（命令预览在其上方，始终可读）。
+/// 日志区：固定高度滚动，贴底跟随交给宿主（跟随开时新行自动滚到底，上滚即脱钩）；
+/// 无日志给空态（命令预览在其上方，始终可读）。
 fn logs_body(core: &Core) -> ViewNode {
     if core.host.logs.is_empty() {
         return empty_state("logs-empty", "file-text", "暂无日志", "启动 llama-server 后，这里显示进程输出。");
     }
     let lines = core.host.logs.iter().map(log_row).collect();
-    scroll_fixed("logs-scroll", LOG_AREA_HEIGHT, 2.0, lines)
+    scroll_fixed("logs-scroll", LOG_AREA_HEIGHT, 2.0, core.host.follow, lines)
 }
 
 /// 一行日志：等宽族按位列对齐（终端样式），时刻前缀同色系。

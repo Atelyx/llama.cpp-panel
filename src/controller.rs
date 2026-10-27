@@ -25,6 +25,34 @@ const HEARTBEAT: Duration = Duration::from_secs(5);
 /// 错误输出可能极长，进通知与快照前截断。
 const ERROR_DETAIL_MAX: usize = 200;
 
+/// 待命期望态（纯函数，供单测）：功能开、无进程、未在启动、未暂缓、探测未连接。
+fn watch_desired(auto_start: bool, pid: Option<u32>, starting: bool, watch_paused: bool, probe_online: bool) -> bool {
+    auto_start && pid.is_none() && !starting && !watch_paused && !probe_online
+}
+
+/// 拉起前的现场校验：模型/投影文件仍在原位、端口没有被别的服务占着——
+/// 这些问题等 llama-server 自己报错退出，原因要绕一层才看得懂。
+fn preflight(settings: &LlamaSettings, probe_online: bool) -> Result<(), String> {
+    let model = settings.model_file.trim();
+    if model.is_empty() {
+        return Err("未选择模型文件".into());
+    }
+    if !std::path::Path::new(model).is_file() {
+        return Err(format!("模型文件不存在或不可读：{model}（可能已被移动或删除，请重新选择）"));
+    }
+    let mmproj = settings.mmproj_file.trim();
+    if !mmproj.is_empty() && !std::path::Path::new(mmproj).is_file() {
+        return Err(format!("视觉投影文件不存在或不可读：{mmproj}（请重新选择或清除投影）"));
+    }
+    if probe_online {
+        return Err(format!(
+            "启动前探测到 {} 已有服务在线（可能是插件外启动的 llama-server）。请先停止它或更换端口；若刚关闭，稍候重试。",
+            crate::settings::base_url(settings)
+        ));
+    }
+    Ok(())
+}
+
 /// 启动并等待服务就绪。返回 false 有两种含义——已有进程/正在启动、启动失败：后者写 error，前者不写。
 pub async fn start(app: &Arc<App>) -> bool {
     {
@@ -41,6 +69,7 @@ pub async fn start(app: &Arc<App>) -> bool {
         host.last_stderr = String::new();
         host.notified = false;
         host.cancelled = false;
+        host.exited = false;
     }
     app.invalidate();
 
@@ -56,6 +85,12 @@ pub async fn start(app: &Arc<App>) -> bool {
     app.invalidate();
 
     let settings = app.core().settings.clone();
+    let probe_online_now = app.core().probe_online;
+    if let Err(message) = preflight(&settings, probe_online_now) {
+        fail_start(app, message);
+        evaluate_watcher(app).await;
+        return false;
+    }
     let located = find_server_executable(&settings.server_dir)
         .and_then(|found| found.ok_or_else(|| missing_executable_message(&settings.server_dir)));
     let server_exe = match located {
@@ -152,6 +187,16 @@ pub async fn start(app: &Arc<App>) -> bool {
     ready
 }
 
+/// 重启 = 停止后紧接启动（调参后的常用循环）。停止失败（句柄保留）时不接着启动，避免双进程抢端口。
+pub async fn restart(app: &Arc<App>) {
+    stop(app).await;
+    if app.core().host().pid.is_some() {
+        app.log_status("停止未完成，已取消重启");
+        return;
+    }
+    start(app).await;
+}
+
 /// 停止本插件启动的进程（结束整棵进程树，不给服务留孤儿）。待命不随停止解除：进程退出后自动重新待命。
 pub async fn stop(app: &Arc<App>) {
     let pid = {
@@ -172,9 +217,20 @@ pub async fn stop(app: &Arc<App>) {
         return;
     };
     match app.ctx.kill(pid).await {
-        Ok(()) => app.log_status("已结束 llama-server 进程"),
+        Ok(()) => {
+            let mut core = app.core();
+            core.host_mut().error = String::new(); // 重试成功即清掉上一次「停止失败」
+            drop(core);
+            app.log_status("已结束 llama-server 进程");
+        }
         Err(err) => {
-            app.core().host_mut().error = err.to_string();
+            // 结束失败时保留句柄：进程可能仍在运行，清掉句柄它就彻底失控且无法再停
+            app.log_line(format!("停止失败：{err}（进程可能仍在运行，可重试停止）"), LogTone::Error);
+            let mut core = app.core();
+            core.host_mut().error = format!("停止失败：{err}（可重试停止）");
+            drop(core);
+            app.invalidate();
+            return;
         }
     }
     // 退出事件稍后到达：pid 已清空即被忽略，状态在此落定
@@ -305,6 +361,12 @@ pub async fn on_process_event(app: &Arc<App>, params: ProcessEventParams) {
                 let host = core.host_mut();
                 host.pid = None;
                 host.running = false;
+                // 停止失败等原因留下的错误行随进程实际退出一并清掉，徽标按真实状态收敛
+                host.error = String::new();
+                // 无人叫停、也非启动等待中的退出 = 服务自己退了（崩溃等）：徽标据此与「已停止」区分
+                if !host.starting && !host.cancelled {
+                    host.exited = true;
+                }
                 let detail = if host.last_stderr.is_empty() {
                     String::new()
                 } else {
@@ -350,7 +412,13 @@ pub async fn evaluate_watcher(app: &Arc<App>) {
         let core = app.core();
         let host = core.host();
         (
-            settings.auto_start_on_api_call && host.pid.is_none() && !host.starting && !host.watch_paused && !core.probe_online,
+            watch_desired(
+                settings.auto_start_on_api_call,
+                host.pid,
+                host.starting,
+                host.watch_paused,
+                core.probe_online,
+            ),
             host.watch,
         )
     };
@@ -367,11 +435,13 @@ pub async fn evaluate_watcher(app: &Arc<App>) {
                 let still_desired = {
                     let core = app.core();
                     let host = core.host();
-                    settings.auto_start_on_api_call
-                        && host.pid.is_none()
-                        && !host.starting
-                        && !host.watch_paused
-                        && !core.probe_online
+                    watch_desired(
+                        settings.auto_start_on_api_call,
+                        host.pid,
+                        host.starting,
+                        host.watch_paused,
+                        core.probe_online,
+                    )
                 };
                 if !still_desired {
                     app.watcher.disarm().await;
@@ -379,6 +449,8 @@ pub async fn evaluate_watcher(app: &Arc<App>) {
                 } else if !watch_now {
                     let mut core = app.core();
                     core.host_mut().watch = true;
+                    // 进待命即不再显示上一次的异常退出：待命本身就是明确的当前状态
+                    core.host_mut().exited = false;
                     drop(core);
                     app.log_status(format!(
                         "自动启动待命中：监听 {}:{}，外部调用将自动启动",
@@ -514,5 +586,54 @@ pub fn watch_hooks(app: &Arc<App>) -> crate::watcher::WatchHooks {
                 }
             });
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_desired_needs_all_conditions() {
+        // 全条件齐备才待命
+        assert!(watch_desired(true, None, false, false, false));
+        // 逐个条件缺失即不应待命
+        assert!(!watch_desired(false, None, false, false, false), "功能未开");
+        assert!(!watch_desired(true, Some(7), false, false, false), "进程还在");
+        assert!(!watch_desired(true, None, true, false, false), "正在启动");
+        assert!(!watch_desired(true, None, false, true, false), "已暂缓");
+        assert!(!watch_desired(true, None, false, false, true), "探测在线（外部服务）");
+    }
+
+    #[test]
+    fn preflight_checks_model_mmproj_and_port() {
+        let dir = std::env::temp_dir().join(format!("llama-panel-pf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.gguf");
+        std::fs::write(&model, b"x").unwrap();
+        let model_path = model.to_string_lossy().replace('\\', "/");
+        let settings_of = |model: String, mmproj: String| LlamaSettings {
+            model_file: model,
+            mmproj_file: mmproj,
+            ..Default::default()
+        };
+
+        let ok = settings_of(model_path.clone(), String::new());
+        assert!(preflight(&ok, false).is_ok());
+        assert!(preflight(&ok, true).is_err(), "端口已被外部服务占用即拒绝启动");
+
+        let missing = settings_of("Z:/no/such.gguf".into(), String::new());
+        let err = preflight(&missing, false).unwrap_err();
+        assert!(err.contains("模型文件不存在"), "{err}");
+
+        let mmproj = dir.join("mmproj.gguf");
+        std::fs::write(&mmproj, b"x").unwrap();
+        let mmproj_path = mmproj.to_string_lossy().replace('\\', "/");
+        let bad_mm = settings_of(model_path.clone(), "Z:/no/such.gguf".into());
+        let err = preflight(&bad_mm, false).unwrap_err();
+        assert!(err.contains("视觉投影文件不存在"), "{err}");
+        let good_mm = settings_of(model_path, mmproj_path);
+        assert!(preflight(&good_mm, false).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

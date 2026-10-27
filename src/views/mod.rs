@@ -221,19 +221,39 @@ fn empty_state(id: impl Into<String>, icon: &str, heading: &str, hint: &str) -> 
 }
 
 fn scroll(id: impl Into<String>, children: Vec<ViewNode>) -> ViewNode {
-    with_children(id, NodeBody::Scroll { direction: None, gap: Some(8.0), height: None }, children)
+    with_children(
+        id,
+        NodeBody::Scroll { direction: None, gap: Some(8.0), height: None, follow_end: None },
+        children,
+    )
 }
 
 /// 固定高度的滚动区（日志：上面吃满剩余高度，这里收住定高）。
-fn scroll_fixed(id: impl Into<String>, height: f32, gap: f32, children: Vec<ViewNode>) -> ViewNode {
-    let mut n = node(id, NodeBody::Scroll { direction: None, gap: Some(gap), height: Some(height) });
+/// `follow_end` = 贴底跟随交给宿主：用户停在底部时内容增高自动跟到新底部，
+/// 上滚即脱钩、滚回底部或插件发 scrollTo(end) 自动恢复。
+fn scroll_fixed(
+    id: impl Into<String>,
+    height: f32,
+    gap: f32,
+    follow_end: bool,
+    children: Vec<ViewNode>,
+) -> ViewNode {
+    let mut n = node(
+        id,
+        NodeBody::Scroll {
+            direction: None,
+            gap: Some(gap),
+            height: Some(height),
+            follow_end: Some(follow_end),
+        },
+    );
     n.children = children;
     n
 }
 
 /// 按键复用控件态的滚动列表（持续追加条目的列表）。
 fn list(id: impl Into<String>, gap: f32, children: Vec<ViewNode>) -> ViewNode {
-    with_children(id, NodeBody::List { gap: Some(gap) }, children)
+    with_children(id, NodeBody::List { gap: Some(gap), follow_end: None }, children)
 }
 
 fn text_sized(
@@ -440,6 +460,23 @@ fn read_only_field(id: impl Into<String>, value: impl Into<String>) -> ViewNode 
             report: None,
         },
     )
+}
+
+/// 密码输入框：宿主按密文渲染；回车 / 失焦才上报（Commit）。
+fn secret_input(id: impl Into<String>, value: impl Into<String>, placeholder: &str) -> ViewNode {
+    let mut n = node(
+        id,
+        NodeBody::TextInput {
+            value: value.into(),
+            placeholder: (!placeholder.is_empty()).then(|| placeholder.to_string()),
+            multiline: None,
+            password: Some(true),
+            read_only: None,
+            report: Some(ReportMode::Commit),
+        },
+    );
+    n.events = vec![EventKind::Change];
+    n
 }
 
 fn number_input(

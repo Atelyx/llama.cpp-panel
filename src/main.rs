@@ -43,9 +43,16 @@ impl Handler {
 #[async_trait::async_trait]
 impl PluginHandler for Handler {
     async fn on_ready(&self, ctx: &Context) {
-        let settings = settings::load(ctx).await;
-        let app = app::build_app(ctx.clone(), settings);
+        let (settings, readable) = settings::load(ctx).await;
+        let app = app::build_app(ctx.clone(), settings, readable);
         let _ = self.app.set(Arc::clone(&app));
+        if !readable {
+            // 读取失败时会话内不落盘（防默认值覆盖磁盘旧值）：让用户知道该怎么办
+            app.log_line(
+                "读取设置失败，本次会话的设置变更不会保存；停用再启用插件可重试。".into(),
+                crate::app::LogTone::Error,
+            );
+        }
         app::initialize(&app).await;
     }
 

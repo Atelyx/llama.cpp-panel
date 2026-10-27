@@ -1,10 +1,10 @@
 //! 模型商店面：检索工具行 + 「结果列表｜仓库详情」分栏 + 下载卡与按地址直下载。
 
-use atelyx_plugin_protocol::view::{ButtonVariant, CardTone, ColorToken, EventKind, NodeBody, ViewNode};
+use atelyx_plugin_protocol::view::{ButtonVariant, CardTone, ColorToken, EventKind, NodeBody, TextWeight, ViewNode};
 
 use super::*;
 use crate::app::{Core, SURFACE_LIBRARY};
-use crate::download::DownloadStatus;
+use crate::download::{DownloadStatus, DownloadTask};
 use crate::hf::SearchSort;
 use crate::modelscan::short_date;
 
@@ -72,9 +72,7 @@ pub fn library(core: &Core) -> ViewNode {
         scroll("lib-detail", detail_pane(core)),
     ));
 
-    if core.dl.status != DownloadStatus::Idle {
-        children.push(download_card(core));
-    }
+    children.extend(download_cards(core));
     children.push(field_row(
         "lib-direct",
         "按地址直接下载",
@@ -204,24 +202,55 @@ fn detail_pane(core: &Core) -> Vec<ViewNode> {
     if detail.files.is_empty() {
         children.push(caption("detail-files-empty", "该仓库没有 .gguf 文件，可能只提供原始权重。"));
     }
+    let local = crate::app::local_library_files(core, &summary.repo);
     for (index, file) in detail.files.iter().enumerate() {
         // 文件相对路径占满左半（长路径会把同行控件顶出可视区，故给占宽行），体积与下载钮贴右；
-        // 下载钮常显（悬停钮在触摸设备上没有着点），整行可聚焦：右键 / 回车 / 空格都触发下载
+        // 本地已有该文件标注「已在库」防重复下载；下载钮常显（悬停钮在触摸设备上没有着点），
+        // 整行可聚焦：右键 / 回车 / 空格都触发下载
+        let mut fright = row(
+            format!("fright{index}"),
+            vec![
+                chip(format!("fsize{index}"), size_label(file.size), ColorToken::TextSecondary),
+                icon_button(format!("f{index}"), "download", "下载", true, vec![EventKind::Click]),
+            ],
+        );
+        if local.contains(&crate::modelscan::file_name_of(&file.name).to_lowercase()) {
+            fright.children.insert(0, chip(format!("fown{index}"), "已在库", ColorToken::Success));
+        }
         let mut file_row = fill_row(
             format!("frow{index}"),
             vec![
                 text_fill(format!("fname{index}"), file.name.clone(), ColorToken::TextSecondary, Some(2)),
-                row(
-                    format!("fright{index}"),
-                    vec![
-                        chip(format!("fsize{index}"), size_label(file.size), ColorToken::TextSecondary),
-                        icon_button(format!("f{index}"), "download", "下载", true, vec![EventKind::Click]),
-                    ],
-                ),
+                fright,
             ],
         );
         file_row.events = vec![EventKind::SecondaryClick, EventKind::Key];
         children.push(with_interaction(file_row, focus_border()));
+    }
+
+    // 分片组一键整组下载（已在库的跳过）：大模型普遍分片发布，逐个手点太繁琐
+    for (group_index, (prefix, indexes)) in crate::hf::shard_groups(&detail.files).iter().enumerate() {
+        let total: u64 = indexes.iter().filter_map(|i| detail.files[*i].size).sum();
+        children.push(spread_row(
+            format!("shardrow{group_index}"),
+            vec![
+                text_secondary(
+                    format!("shardname{group_index}"),
+                    format!("分片 {prefix}（{} 个）", indexes.len()),
+                ),
+                button(
+                    format!("shards{group_index}"),
+                    if total > 0 {
+                        format!("下载全部分片（{}）", crate::modelscan::format_size(Some(total)))
+                    } else {
+                        "下载全部分片".to_string()
+                    },
+                    ButtonVariant::Ghost,
+                    true,
+                    vec![EventKind::Click],
+                ),
+            ],
+        ));
     }
 
     if !detail.readme.is_empty() {
@@ -232,68 +261,81 @@ fn detail_pane(core: &Core) -> Vec<ViewNode> {
     children
 }
 
-/// 下载任务卡：状态徽标 + 进度 + 读数 + 暂停/继续/改名/关闭。
-fn download_card(core: &Core) -> ViewNode {
-    let task = &core.dl;
+/// 下载任务区：计数徽标 + 「清空已完成」（有已落定任务时）+ 每任务一张卡。
+fn download_cards(core: &Core) -> Vec<ViewNode> {
+    if core.dls.is_empty() {
+        return vec![];
+    }
+    let finished =
+        core.dls.iter().any(|task| matches!(task.status, DownloadStatus::Done | DownloadStatus::Error));
+    let mut head = vec![
+        section_head("dl-title", "下载任务"),
+        chip("dl-count", format!("{} 个", core.dls.len()), ColorToken::TextSecondary),
+    ];
+    if finished {
+        head.push(button("dlclear", "清空已完成", ButtonVariant::Ghost, true, vec![EventKind::Click]));
+    }
+    let mut children = vec![spread_row("dl-head", head)];
+    children.extend(core.dls.iter().map(task_card));
+    vec![card_box("dl-card", false, CardTone::Default, 10.0, children)]
+}
+
+/// 一张任务卡：名字 + 状态徽标 + 进度 + 读数 + 按状态给操作钮。
+/// 任务 id 编码进节点 id（dlpause{id} 等），路由按它定位任务。
+fn task_card(task: &DownloadTask) -> ViewNode {
+    let id = task.id;
     let name = if task.repo.is_empty() && task.file.is_empty() {
         "下载任务".to_string()
     } else {
         format!("{}/{}", task.repo, task.file)
     };
     let (state, color) = match task.status {
+        DownloadStatus::Queued => ("排队中", ColorToken::TextMuted),
         DownloadStatus::Downloading => ("下载中", ColorToken::Accent),
         DownloadStatus::Paused => ("已暂停", ColorToken::TextSecondary),
         DownloadStatus::Done => ("已完成", ColorToken::Success),
         DownloadStatus::Error => ("失败", ColorToken::Danger),
-        DownloadStatus::Idle => ("空闲", ColorToken::TextMuted),
     };
-    let mut children = vec![
-        spread_row(
-            "dl-head",
-            vec![
-                section_head("dl-title", name),
-                chip("dl-state", state, color),
-            ],
-        ),
-    ];
+    let mut children = vec![spread_row(
+        format!("dl-row{id}"),
+        vec![
+            text_sized(format!("dl-name{id}"), name, 1.0, TextWeight::Medium, ColorToken::Text),
+            chip(format!("dl-state{id}"), state, color),
+        ],
+    )];
     if task.status == DownloadStatus::Downloading {
         if let Some(total) = task.total_bytes.filter(|total| *total > 0) {
             children.push(node(
-                "dl-bar",
+                format!("dl-bar{id}"),
                 NodeBody::Progress { value: task.bytes as f64 / total as f64, girth: Some(6.0), tone: None },
             ));
         }
     }
     if !task.status_text.is_empty() {
         children.push(if task.status == DownloadStatus::Error {
-            text_tone("dl-status", task.status_text.clone(), ColorToken::Danger)
+            text_tone(format!("dl-status{id}"), task.status_text.clone(), ColorToken::Danger)
         } else {
-            text_secondary("dl-status", task.status_text.clone())
+            text_secondary(format!("dl-status{id}"), task.status_text.clone())
         });
     }
-    if let Some(target) = (!task.target.is_empty() && task.status != DownloadStatus::Done)
-        .then_some(task.target.as_str())
-    {
-        children.push(caption("dl-target", format!("落盘：{target}")));
+    if !task.target.is_empty() && task.status != DownloadStatus::Done {
+        children.push(caption(format!("dl-target{id}"), format!("落盘：{}", task.target)));
     }
     let mut actions = vec![];
     if task.status == DownloadStatus::Downloading {
-        actions.push(button("dlpause", "暂停", ButtonVariant::Ghost, true, vec![EventKind::Click]));
+        actions.push(button(format!("dlpause{id}"), "暂停", ButtonVariant::Ghost, true, vec![EventKind::Click]));
     }
-    if core.lib.last_download.is_some() {
-        // 暂停态给「继续」（.part 保留，断点续传）
-        if task.status == DownloadStatus::Paused {
-            actions.push(button("dlresume", "继续", ButtonVariant::Primary, true, vec![EventKind::Click]));
-        }
+    if task.status == DownloadStatus::Paused {
+        actions.push(button(format!("dlresume{id}"), "继续", ButtonVariant::Primary, true, vec![EventKind::Click]));
+    }
+    if task.status == DownloadStatus::Error && task.conflict {
         // 只有目标重名被拒时才给「改名保留」：其余失败换名也下不来
-        if task.status == DownloadStatus::Error && core.lib.dl_conflict {
-            actions.push(button("dlrename", "改名保留", ButtonVariant::Ghost, true, vec![EventKind::Click]));
-        }
+        actions.push(button(format!("dlrename{id}"), "改名保留", ButtonVariant::Ghost, true, vec![EventKind::Click]));
     }
     if task.status != DownloadStatus::Downloading {
-        // 下载中没有「关闭」：任务未落定前收掉卡片只会把进度与结果一起藏掉
-        actions.push(button("dldismiss", "关闭", ButtonVariant::Ghost, true, vec![EventKind::Click]));
+        // 下载中没有「移除」：任务未落定前收掉卡片只会把进度与结果一起藏掉
+        actions.push(button(format!("dlremove{id}"), "移除", ButtonVariant::Ghost, true, vec![EventKind::Click]));
     }
-    children.push(row("dl-actions", actions));
-    card_box("dl-card", false, CardTone::Default, 10.0, children)
+    children.push(row(format!("dl-actions{id}"), actions));
+    column_gap(format!("dl{id}"), 4.0, children)
 }

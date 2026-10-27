@@ -15,10 +15,29 @@ fn test_core() -> Core {
         host: Default::default(),
         lib: Default::default(),
         scan: Default::default(),
-        dl: crate::download::DownloadTask::idle(),
+        dls: Vec::new(),
         tray_supported: true,
         tray_signature: String::new(),
     }
+}
+
+/// 构造一条指定状态的下载任务（id 自增保证节点 id 唯一）。
+fn dl_task(core: &mut Core, status: DownloadStatus, conflict: bool) -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    core.dls.push(crate::download::DownloadTask {
+        id,
+        status,
+        repo: "owner/repo".into(),
+        file: "a.gguf".into(),
+        target: "/models/owner/repo/a.gguf".into(),
+        url: "https://example/a.gguf".into(),
+        total_bytes: Some(1000),
+        bytes: 500,
+        conflict,
+        status_text: "测试任务".into(),
+    });
+    id
 }
 
 fn summary(repo: &str) -> crate::hf::ModelSummary {
@@ -72,14 +91,13 @@ fn library_tree_survives_state_combinations() {
         ],
         readme: "简介".into(),
     });
-    core.dl.status = DownloadStatus::Downloading;
-    core.dl.total_bytes = Some(1000);
+    let running_id = dl_task(&mut core, DownloadStatus::Downloading, false);
     let tree = build(&core, SURFACE_LIBRARY).unwrap();
     tree.validate().unwrap();
     assert!(tree.find("rcard0").is_some());
     assert!(tree.find("f0").is_some());
     assert!(tree.find("detail-title").is_some());
-    assert!(tree.find("dl-bar").is_some(), "下载中给进度条");
+    assert!(tree.find(&format!("dl-bar{running_id}")).is_some(), "下载中给进度条");
     assert!(
         matches!(tree.find("detail-readme").map(|n| &n.body), Some(NodeBody::Markdown { .. })),
         "模型简介交宿主按 Markdown 渲染"
@@ -226,26 +244,119 @@ fn log_rows_use_mono_family() {
 #[test]
 fn download_card_gates_actions_by_state() {
     let mut core = test_core();
-    core.lib.last_download = Some(crate::download::DownloadRequest {
-        input: "owner/repo/a.gguf".into(),
-        dir: "/models".into(),
-        mirror_id: "hf-mirror".into(),
-    });
 
-    // 下载中：给暂停、不给「关闭」（任务未落定前收掉卡片只会藏掉进度）
-    core.dl.status = DownloadStatus::Downloading;
+    // 下载中：给暂停、不给「移除」（任务未落定前收掉卡片只会藏掉进度）
+    let running = dl_task(&mut core, DownloadStatus::Downloading, false);
     let tree = build(&core, SURFACE_LIBRARY).unwrap();
-    assert!(tree.find("dlpause").is_some());
-    assert!(tree.find("dldismiss").is_none());
+    assert!(tree.find(&format!("dlpause{running}")).is_some());
+    assert!(tree.find(&format!("dlremove{running}")).is_none());
+    assert!(tree.find("dlclear").is_none(), "没有已落定任务时不给清空");
 
     // 失败：只有目标重名才挂「改名保留」，其余失败换名也下不来
-    core.dl.status = DownloadStatus::Error;
+    let failed = dl_task(&mut core, DownloadStatus::Error, false);
     let tree = build(&core, SURFACE_LIBRARY).unwrap();
-    assert!(tree.find("dlrename").is_none(), "非重名失败不给改名入口");
-    core.lib.dl_conflict = true;
+    assert!(tree.find(&format!("dlrename{failed}")).is_none(), "非重名失败不给改名入口");
+    assert!(tree.find("dlclear").is_some(), "有已落定任务时给清空");
+
+    let mut core = test_core();
+    let conflicted = dl_task(&mut core, DownloadStatus::Error, true);
     let tree = build(&core, SURFACE_LIBRARY).unwrap();
-    assert!(tree.find("dlrename").is_some());
-    assert!(tree.find("dldismiss").is_some(), "落定后可关卡片");
+    assert!(tree.find(&format!("dlrename{conflicted}")).is_some());
+    assert!(tree.find(&format!("dlremove{conflicted}")).is_some(), "落定后可移除卡片");
+
+    // 暂停给「继续」；排队中只等位，不给启停钮
+    let mut core = test_core();
+    let paused = dl_task(&mut core, DownloadStatus::Paused, false);
+    let tree = build(&core, SURFACE_LIBRARY).unwrap();
+    assert!(tree.find(&format!("dlresume{paused}")).is_some());
+    let mut core = test_core();
+    let queued = dl_task(&mut core, DownloadStatus::Queued, false);
+    let tree = build(&core, SURFACE_LIBRARY).unwrap();
+    assert!(tree.find(&format!("dlpause{queued}")).is_none());
+    assert!(tree.find(&format!("dlremove{queued}")).is_some(), "排队中可撤下");
+}
+
+#[test]
+fn detail_marks_local_files_and_shard_groups() {
+    let mut core = test_core();
+    core.settings.models_dir = "/models".into();
+    core.scan.folders.push(crate::modelscan::ModelFolder {
+        rel: "Qwen/Qwen3.5-9B".into(),
+        full: "/models/Qwen/Qwen3.5-9B".into(),
+        quants: vec![crate::modelscan::ModelEntry { name: "Qwen/Qwen3.5-9B/a.gguf".into(), size: Some(1) }],
+        mms: vec![],
+    });
+    core.lib.detail = Some(crate::hf::RepoDetail {
+        summary: summary("Qwen/Qwen3.5-9B"),
+        gated: false,
+        files: vec![
+            crate::hf::RepoFile { name: "a.gguf".into(), size: Some(1) },
+            crate::hf::RepoFile { name: "b-00001-of-00002.gguf".into(), size: Some(1) },
+            crate::hf::RepoFile { name: "b-00002-of-00002.gguf".into(), size: Some(1) },
+        ],
+        readme: String::new(),
+    });
+    let tree = build(&core, SURFACE_LIBRARY).unwrap();
+    assert!(tree.find("fown0").is_some(), "本地已有的文件标「已在库」");
+    assert!(tree.find("fown1").is_none(), "本地没有的文件不标");
+    assert!(tree.find("shards0").is_some(), "识别分片组并给整组下载入口");
+}
+
+#[test]
+fn console_offers_restart_and_secret_api_key() {
+    let mut core = test_core();
+    core.scan.folders = vec![folder("qwen/Qwen3-14B")];
+    let tree = build(&core, SURFACE_CONSOLE).unwrap();
+    let restart = tree.find("restart").expect("重启按钮常驻");
+    assert!(
+        matches!(&restart.body, NodeBody::Button { enabled: Some(false), .. }),
+        "未运行时重启不可点"
+    );
+
+    core.settings.model_file = "/models/qwen/Qwen3-14B/q5.gguf".into();
+    core.host.pid = Some(7);
+    let tree = build(&core, SURFACE_CONSOLE).unwrap();
+    let restart = tree.find("restart").unwrap();
+    assert!(
+        matches!(&restart.body, NodeBody::Button { enabled: Some(true), .. }),
+        "运行中给一键重启"
+    );
+    let input = tree.find("apikey").expect("API 密钥输入框");
+    assert!(
+        matches!(&input.body, NodeBody::TextInput { password: Some(true), report: Some(ReportMode::Commit), .. }),
+        "密钥框密文渲染、回车/失焦才上报"
+    );
+    assert!(input.events.contains(&EventKind::Change));
+}
+
+#[test]
+fn run_phase_distinguishes_crash_from_manual_stop() {
+    let mut core = test_core();
+    assert_eq!(core.run_phase(), crate::app::RunPhase::Stopped);
+    core.host.exited = true;
+    assert_eq!(core.run_phase(), crate::app::RunPhase::Exited, "无人叫停的进程退出与手动停止分开显示");
+    core.host.error = "boom".into();
+    assert_eq!(core.run_phase(), crate::app::RunPhase::Failed, "宿主级错误优先于已退出");
+    core.host.watch = true;
+    assert_eq!(core.run_phase(), crate::app::RunPhase::Watching, "待命优先于失败与已退出");
+    core.host.pid = Some(7);
+    assert_eq!(core.run_phase(), crate::app::RunPhase::Running);
+    core.host.starting = true;
+    assert_eq!(core.run_phase(), crate::app::RunPhase::Starting);
+}
+
+#[test]
+fn option_tables_match_settings_whitelists() {
+    // 界面选项与设置侧合法值表不一致时，已存的合法值会显示成「默认」而命令仍带旗标
+    for value in CACHE_K_OPTIONS.iter().filter(|v| !v.is_empty()) {
+        assert!(crate::settings::KV_K_TYPES.contains(value), "KV 缓存选项 {value} 不在合法值表");
+    }
+    for value in LOAD_MODE_OPTIONS.iter().filter(|v| !v.is_empty()) {
+        assert!(crate::settings::LOAD_MODES.contains(value), "载入模式选项 {value} 不在合法值表");
+    }
+    for value in crate::settings::LOAD_MODES {
+        assert!(LOAD_MODE_OPTIONS.contains(&value), "合法载入模式 {value} 缺界面选项");
+    }
 }
 
 #[test]

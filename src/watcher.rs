@@ -134,8 +134,12 @@ async fn accept_loop(
         let (method, _path) = split_request_line(&first);
         if !is_trigger_method(&method) {
             (hooks.on_noise)(first);
-            // 非触发请求不服务：直接断开
+            // 非触发请求不服务：回一个 503（服务加载中的语义）再断开，
+            // 轮询型客户端据此按状态码重试，而不是当成连接故障
             let mut socket = socket;
+            let _ = socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
             let _ = socket.shutdown().await;
             continue;
         }
@@ -375,9 +379,13 @@ mod tests {
         let watcher = Watcher::default();
         watcher.arm(&settings, hooks).await.unwrap();
 
-        // GET 探测：落噪音、不断链回包也不触发
+        // GET 探测：落噪音、回 503（不触发）
         let mut client = TcpStream::connect(("127.0.0.1", watch_port)).await.unwrap();
         client.write_all(b"GET /api/models HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(500), client.read_to_end(&mut reply)).await;
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.contains("503"), "噪音请求回 503 让客户端按状态码重试：{text}");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(noise.lock().unwrap().iter().any(|l| l.contains("GET /api/models")));
         assert!(triggered.lock().unwrap().is_empty(), "GET 不触发");

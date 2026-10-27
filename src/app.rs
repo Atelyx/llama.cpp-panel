@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use atelyx_plugin_protocol::method::{ContributionSlot, ProcessEventParams, ScrollEdge, ViewEventParams};
+use atelyx_plugin_protocol::method::{
+    ContributionSlot, NotificationLevel, ProcessEventParams, ScrollEdge, ViewEventParams,
+};
 use atelyx_plugin_protocol::layout::LayoutSpecNode;
 use atelyx_plugin_protocol::view::{Axis, ColorToken, EventValue, Key, KeyAction, NamedKey, ViewEvent};
 use atelyx_plugin_sdk::Context;
@@ -65,13 +67,15 @@ pub struct LogLine {
     pub ansi: Option<ColorToken>,
 }
 
-/// 运行状态（运行中/启动中/待命中/已停止/启动失败），由进程与待命字段推导。
+/// 运行状态（运行中/启动中/待命中/已停止/已退出/启动失败），由进程与待命字段推导。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunPhase {
     Running,
     Starting,
     Watching,
     Stopped,
+    /// 非用户操作的进程退出（崩溃等）：与手动停止区分开，退出码在日志里。
+    Exited,
     Failed,
 }
 
@@ -82,8 +86,9 @@ impl RunPhase {
             RunPhase::Running => "运行中",
             RunPhase::Starting => "启动中",
             RunPhase::Watching => "待命中",
-            RunPhase::Failed => "启动失败",
             RunPhase::Stopped => "已停止",
+            RunPhase::Exited => "已退出",
+            RunPhase::Failed => "启动失败",
         }
     }
 }
@@ -102,10 +107,9 @@ pub struct HostState {
     pub log_seq: u64,
     /// 回刷中的逻辑行序号：`\r` 结尾的后续拍覆盖这一行，而不是新起一行。
     pub pending: Option<u64>,
-    /// 跟随最新（装配时开）：新日志落地后把列表滚到底；关闭后不打扰正在回看的用户。
+    /// 跟随最新（装配时开）：交给宿主贴底跟随——用户停在底部时新行自动滚到底，
+    /// 上滚即脱钩不打扰回看；重新开启时插件补发一次滚到底恢复贴底。
     pub follow: bool,
-    /// 已跟随滚动到的日志序号：与 `log_seq` 不等即有新行待滚。
-    pub scrolled_seq: u64,
     /// 最近一次操作的错误。
     pub error: String,
     /// 等待就绪期间进程退出或出错的原因；非空即终止等待。
@@ -116,6 +120,8 @@ pub struct HostState {
     pub notified: bool,
     /// 本次启动是否被用户主动停止：收场同样是进程退出，但不是失败。
     pub cancelled: bool,
+    /// 进程在无人叫停的情况下退出了（崩溃等）：徽标据此与「已停止」区分。
+    pub exited: bool,
     /// 自动启动暂缓：启动失败或待命异常后置位，手动启动或功能开启下的设置变更时清位。
     pub watch_paused: bool,
     /// 每轮暂缓最多提示一次。
@@ -209,16 +215,14 @@ pub struct LibraryState {
     pub detail_loading: bool,
     /// 已取回的仓库详情（镜像 + 仓库为键，最近访问在尾部）。
     pub detail_cache: VecDeque<CachedDetail>,
-    /// 最近一次预检的请求：重名拒绝后「改名保留」按它重试。
-    pub last_download: Option<DownloadRequest>,
     /// 按地址直接下载的输入框回显值。
     pub dl_input: String,
     /// 列表已取到末尾：接口返回不足一页即判定没有下一页，不再挂「加载更多」。
     pub exhausted: bool,
     /// 检索轮次：每次发起检索自增，落地时轮次不符即丢弃（旧关键词的在途结果不得覆盖当前列表）。
     pub search_gen: u64,
-    /// 最近一次下载失败是否因目标重名：只有重名才值得挂「改名保留」。
-    pub dl_conflict: bool,
+    /// 详情加载轮次：并发点击时最后点击胜出，落地时轮次不符即丢弃。
+    pub detail_gen: u64,
 }
 
 /// 详情缓存条目：同一镜像下的同一仓库在有效期内不再打接口。
@@ -274,11 +278,10 @@ impl Default for LibraryState {
             detail: None,
             detail_loading: false,
             detail_cache: Default::default(),
-            last_download: None,
             dl_input: String::new(),
             exhausted: false,
             search_gen: 0,
-            dl_conflict: false,
+            detail_gen: 0,
         }
     }
 }
@@ -305,8 +308,8 @@ pub struct Core {
     pub host: HostState,
     pub lib: LibraryState,
     pub scan: ScanState,
-    /// 下载任务快照（模型库视图的下载卡）。
-    pub dl: DownloadTask,
+    /// 下载任务快照列表（模型库视图的任务卡）。
+    pub dls: Vec<DownloadTask>,
     /// 托盘条目是否可用：平台不支持（非 Windows）时置假，之后不再提交。
     pub tray_supported: bool,
     /// 已提交的托盘条目签名：只在状态变化时整发整换，不按拍重提。
@@ -322,7 +325,7 @@ impl Core {
         &mut self.host
     }
 
-    /// 运行状态推导：优先级 = 启动中 > 运行中 > 待命中 > 启动失败 > 已停止。
+    /// 运行状态推导：优先级 = 启动中 > 运行中 > 待命中 > 启动失败 > 已退出 > 已停止。
     pub fn run_phase(&self) -> RunPhase {
         let host = &self.host;
         if host.starting {
@@ -333,6 +336,8 @@ impl Core {
             RunPhase::Watching
         } else if !host.error.is_empty() {
             RunPhase::Failed
+        } else if host.exited {
+            RunPhase::Exited
         } else {
             RunPhase::Stopped
         }
@@ -355,6 +360,8 @@ pub struct App {
     process_rx: Mutex<Option<mpsc::UnboundedReceiver<ProcessEventParams>>>,
     /// 取数与探测共用一条 HTTP 通道。
     pub client: reqwest::Client,
+    /// 设置读取是否成功：失败时暂停落盘，防止默认值覆盖磁盘上的既有设置。
+    settings_writable: bool,
     save_gen: AtomicU64,
 }
 
@@ -392,58 +399,119 @@ impl App {
         self.log_line(text.into(), LogTone::Normal);
     }
 
-    /// 设置落盘（防抖）：窗口内最后一次生效。
+    /// 设置落盘（防抖）：窗口内最后一次生效。读取失败时会话内不落盘（防覆盖磁盘旧值）。
     pub fn schedule_save(self: &Arc<Self>) {
+        if !self.settings_writable {
+            return;
+        }
         let gen = self.save_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let app = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(SAVE_DEBOUNCE).await;
             if app.save_gen.load(Ordering::SeqCst) == gen {
                 let settings = app.core().settings.clone();
-                settings::save(&app.ctx, &settings).await;
+                if let Err(err) = settings::save(&app.ctx, &settings).await {
+                    eprintln!("{err}");
+                    app.log_line(err, LogTone::Error);
+                }
             }
         });
     }
 
-    /// 下载任务快照落状态；完成即触发重扫（模型列表要看到新落盘的文件）。
-    fn on_download_task(self: &Arc<Self>, task: DownloadTask) {
-        let done = task.status == DownloadStatus::Done;
-        self.core().dl = task;
+    /// 下载任务列表落状态；有任务新近完成即触发重扫与完成/失败通知
+    /// （新出现的错误卡不通知：用户刚点下，卡片就在眼前）。
+    fn on_download_tasks(self: &Arc<Self>, tasks: Vec<DownloadTask>) {
+        let (fresh_done, fresh_failed) = {
+            let mut core = self.core();
+            let known: std::collections::HashMap<u64, DownloadStatus> =
+                core.dls.iter().map(|task| (task.id, task.status)).collect();
+            let mut done = Vec::new();
+            let mut failed = Vec::new();
+            for task in &tasks {
+                let was_active = matches!(
+                    known.get(&task.id),
+                    Some(DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Paused)
+                );
+                match task.status {
+                    DownloadStatus::Done if was_active => done.push(task.clone()),
+                    DownloadStatus::Error if was_active => failed.push(task.clone()),
+                    _ => {}
+                }
+            }
+            core.dls = tasks;
+            (done, failed)
+        };
         self.invalidate();
-        if done {
+        for task in &fresh_done {
+            spawn_task_notify(
+                self,
+                format!("模型下载完成：{}", task_display(task)),
+                &task.target,
+                NotificationLevel::Info,
+            );
+        }
+        for task in &fresh_failed {
+            spawn_task_notify(
+                self,
+                format!("模型下载失败：{}", task_display(task)),
+                &task.status_text,
+                NotificationLevel::Error,
+            );
+        }
+        if !fresh_done.is_empty() {
             let app = Arc::clone(self);
             tokio::spawn(async move { scan_models(&app).await });
         }
     }
 
-    /// 清空日志显示（累计序号不动，避免已滚位置与新行错位）。
+    /// 清空日志显示（累计序号不动，视图按键不错位）。
     pub fn clear_logs(&self) {
         {
             let mut core = self.core();
             let host = core.host_mut();
             host.logs.clear();
             host.pending = None;
-            host.scrolled_seq = host.log_seq;
         }
         self.invalidate();
     }
 
-    /// 切换跟随最新；重新打开时把已滚位置归零，下一轮渲染立即滚到底。
+    /// 切换跟随最新；重新开启时补发一次滚到底（宿主据此恢复贴底跟随）。
     pub fn set_follow(&self, follow: bool) {
-        {
-            let mut core = self.core();
-            let host = core.host_mut();
-            host.follow = follow;
-            if follow {
-                host.scrolled_seq = 0;
-            }
-        }
+        self.core().host_mut().follow = follow;
         self.invalidate();
+        if follow {
+            let ctx = self.ctx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = ctx.scroll_to(SURFACE_CONSOLE, "logs-scroll", ScrollEdge::End).await {
+                    eprintln!("日志跟随滚动失败：{err}");
+                }
+            });
+        }
     }
 }
 
 fn chrono_secs() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// 通知里指代一个下载任务的名字。
+fn task_display(task: &DownloadTask) -> String {
+    if task.repo.is_empty() && task.file.is_empty() {
+        "下载任务".to_string()
+    } else {
+        format!("{}/{}", task.repo, task.file)
+    }
+}
+
+/// 下载终局弹一条宿主通知：面板不可见时也能知道结果。
+fn spawn_task_notify(app: &Arc<App>, title: String, body: &str, level: NotificationLevel) {
+    let ctx = app.ctx.clone();
+    let body = crate::logfmt::truncate(body, 200);
+    tokio::spawn(async move {
+        if let Err(err) = ctx.notify(&title, Some(&body), level).await {
+            eprintln!("通知发送失败（{title}）：{err}");
+        }
+    });
 }
 
 /// 缓存判龄用的时刻（epoch 秒）。
@@ -452,15 +520,15 @@ fn epoch_secs() -> i64 {
 }
 
 /// 装配共享状态（下载回调经 Weak 回接，避免 App ↔ Downloader 的强引用环）。
-pub fn build_app(ctx: Context, settings: LlamaSettings) -> Arc<App> {
+pub fn build_app(ctx: Context, settings: LlamaSettings, settings_writable: bool) -> Arc<App> {
     let client = reqwest::Client::builder().build().expect("HTTP 客户端构建失败");
     let (process_tx, process_rx) = mpsc::unbounded_channel();
     Arc::new_cyclic(|weak: &Weak<App>| {
         let notify: crate::download::Notify = {
             let weak = weak.clone();
-            Arc::new(move |task| {
+            Arc::new(move |tasks| {
                 if let Some(app) = weak.upgrade() {
-                    app.on_download_task(task);
+                    app.on_download_tasks(tasks);
                 }
             })
         };
@@ -474,7 +542,7 @@ pub fn build_app(ctx: Context, settings: LlamaSettings) -> Arc<App> {
                 host: HostState { follow: true, ..HostState::default() },
                 lib: LibraryState::default(),
                 scan: ScanState::default(),
-                dl: DownloadTask::idle(),
+                dls: Vec::new(),
                 tray_supported: true,
                 tray_signature: String::new(),
             }),
@@ -485,6 +553,7 @@ pub fn build_app(ctx: Context, settings: LlamaSettings) -> Arc<App> {
             process_tx,
             process_rx: Mutex::new(Some(process_rx)),
             client,
+            settings_writable,
             save_gen: AtomicU64::new(0),
         }
     })
@@ -519,15 +588,6 @@ pub async fn initialize(app: &Arc<App>) {
     tokio::spawn(process_consumer(Arc::clone(app)));
     tokio::spawn(probe_loop(Arc::clone(app)));
     tray::spawn(app);
-    // 首次探测出结果后做一次待命裁决：加载期若服务本就未运行，探测结果无变化、
-    // 不会产生状态事件，必须显式裁决一次才会进入待命
-    let probe_app = Arc::clone(app);
-    tokio::spawn(async move {
-        let settings = probe_app.core().settings.clone();
-        let online = probe_once(&probe_app.client, &settings).await;
-        controller::on_probe_result(&probe_app, online).await;
-        controller::evaluate_watcher(&probe_app).await;
-    });
     if !app.core().settings.models_dir.is_empty() {
         let app = Arc::clone(app);
         tokio::spawn(async move { scan_models(&app).await });
@@ -577,39 +637,19 @@ async fn render_loop(app: Arc<App>) {
 async fn render_attached(app: &Arc<App>) {
     let attached: Vec<String> = app.core().attached.iter().cloned().collect();
     for surface in attached {
-        match app.ctx.ui().notify(&surface).await {
-            Ok(true) => {
-                // 树已上行后再滚：新行已在宿主侧；指令只在新行落地后发一次
-                if surface == SURFACE_CONSOLE {
-                    follow_logs(app).await;
-                }
-            }
-            Ok(false) => {}
-            Err(err) => eprintln!("界面提交失败（{surface}）：{err}"),
+        if let Err(err) = app.ctx.ui().notify(&surface).await {
+            eprintln!("界面提交失败（{surface}）：{err}");
         }
     }
 }
 
-/// 跟随最新：把日志列表滚到底。已在底部或已关闭跟随时不发指令。
-async fn follow_logs(app: &Arc<App>) {
-    let pending = {
-        let core = app.core();
-        let host = core.host();
-        host.follow && !host.logs.is_empty() && host.log_seq != host.scrolled_seq
-    };
-    if !pending {
-        return;
-    }
-    if let Err(err) = app.ctx.scroll_to(SURFACE_CONSOLE, "logs-scroll", ScrollEdge::End).await {
-        // 失败不记账：这批新行的跟随留给下一次日志到达重试，否则会永久停在半路
-        eprintln!("日志跟随滚动失败：{err}");
-        return;
-    }
-    let last_seq = app.core().host().log_seq;
-    app.core().host_mut().scrolled_seq = last_seq;
-}
-
 async fn probe_loop(app: Arc<App>) {
+    // 首轮探测后无条件裁决一次待命：服务本就未运行时探测结果无变化、不产生状态事件，
+    // 不显式裁决待命永远不会进入
+    let settings = app.core().settings.clone();
+    let online = probe_once(&app.client, &settings).await;
+    controller::on_probe_result(&app, online).await;
+    controller::evaluate_watcher(&app).await;
     loop {
         let suspended = app.core().probe_suspended;
         if !suspended {
@@ -661,15 +701,18 @@ pub fn on_surface(app: &Arc<App>, surface_id: &str, attached: bool) {
         {
             let mut core = app.core();
             core.attached.insert(surface_id.to_string());
-            // 控制台重新挂载：跟随开启时从底部开始（挂载前已有的行也算待跟随）
-            if surface_id == SURFACE_CONSOLE {
-                core.host_mut().scrolled_seq = 0;
-            }
         }
+        // 控制台重新挂载：跟随开启时补一次滚到底（宿主贴底跟随据此从底部开始）
         if surface_id == SURFACE_CONSOLE {
-            // 重发的树已在宿主侧，列表此刻才能滚
-            let app = Arc::clone(app);
-            tokio::spawn(async move { follow_logs(&app).await });
+            let follow = app.core().host().follow;
+            if follow && !app.core().host().logs.is_empty() {
+                let ctx = app.ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = ctx.scroll_to(SURFACE_CONSOLE, "logs-scroll", ScrollEdge::End).await {
+                        eprintln!("日志跟随滚动失败：{err}");
+                    }
+                });
+            }
         }
         // 模型商店首开自动加载首页列表（热门排序），无需先输入关键词
         if surface_id == SURFACE_LIBRARY {
@@ -796,25 +839,26 @@ async fn library_event(app: &Arc<App>, node: &str, event: &ViewEvent) {
             let input = app.core().lib.dl_input.clone();
             download_direct(app, input).await;
         }
-        "dlresume" => {
-            // 暂停任务的继续：按上次请求重新预检（.part 在，自动断点续传）
-            let request = app.core().lib.last_download.clone();
-            if let Some(request) = request {
-                start_download(app, request, false).await;
-            }
-        }
-        "dlrename" => {
-            // 重名拒绝后的「改名保留」：按上次请求换带序号的名字重来
-            let request = app.core().lib.last_download.clone();
-            if let Some(request) = request {
-                start_download(app, request, true).await;
-            }
-        }
-        "dlpause" => app.downloader.cancel(),
-        "dldismiss" => app.downloader.dismiss(),
         other => {
-            // 检索结果卡（rcard{i}）与详情文件行（frow{i} / f{i}）：下标编码在节点 id 里
-            if let Some(index) = other.strip_prefix("frow").and_then(|n| n.parse::<usize>().ok()) {
+            // 检索结果卡（rcard{i}）、详情文件行（frow{i} / f{i}）、分片组（shards{i}）
+            // 与下载任务操作（dlpause{id} 等）：下标或任务 id 编码在节点 id 里
+            if let Some(id) = other.strip_prefix("dlpause").and_then(|n| n.parse::<u64>().ok()) {
+                app.downloader.pause(id);
+            } else if let Some(id) = other.strip_prefix("dlresume").and_then(|n| n.parse::<u64>().ok()) {
+                app.downloader.resume(id);
+            } else if let Some(id) = other.strip_prefix("dlrename").and_then(|n| n.parse::<u64>().ok()) {
+                // 改名保留：按原请求换带序号的名字重来，错误卡由新预检结果替代
+                if let Some(request) = app.downloader.request_of(id) {
+                    app.downloader.remove(id);
+                    submit_download(app, request, true).await;
+                }
+            } else if let Some(id) = other.strip_prefix("dlremove").and_then(|n| n.parse::<u64>().ok()) {
+                app.downloader.remove(id);
+            } else if other == "dlclear" {
+                app.downloader.clear_finished();
+            } else if let Some(index) = other.strip_prefix("shards").and_then(|n| n.parse::<usize>().ok()) {
+                download_shard_group(app, index).await;
+            } else if let Some(index) = other.strip_prefix("frow").and_then(|n| n.parse::<usize>().ok()) {
                 // 文件行整行可聚焦：右键或回车/空格即下载，与行内下载钮同一动作
                 if triggers_download(event) {
                     download_detail_file(app, index, false).await;
@@ -841,7 +885,7 @@ fn triggers_download(event: &ViewEvent) -> bool {
 }
 
 /// 复制到剪贴板：剪贴板没有界面反馈，成败各落一行日志（失败同时留 stderr 原因）。
-async fn copy_text(app: &Arc<App>, text: String, what: &str) {
+pub(crate) async fn copy_text(app: &Arc<App>, text: String, what: &str) {
     if text.is_empty() {
         return;
     }
@@ -907,7 +951,66 @@ async fn download_direct(app: &Arc<App>, input: String) {
         mirror_id: app.core().settings.download_mirror.clone(),
     };
     app.core().lib.dl_input = String::new();
-    start_download(app, request, false).await;
+    app.invalidate();
+    submit_download(app, request, false).await;
+}
+
+/// 本地模型库里 `repo` 对应文件夹已有的文件名（小写化便于比对）；目录未扫到返回空集。
+pub(crate) fn local_library_files(core: &Core, repo: &str) -> std::collections::HashSet<String> {
+    let repo_dir = crate::settings::normalize_dir(&format!(
+        "{}/{}",
+        core.settings.models_dir.trim().replace('\\', "/"),
+        repo
+    ));
+    core.scan
+        .folders
+        .iter()
+        .find(|folder| crate::settings::normalize_dir(&folder.full) == repo_dir)
+        .map(|folder| {
+            folder
+                .quants
+                .iter()
+                .chain(folder.mms.iter())
+                .map(|entry| crate::modelscan::file_name_of(&entry.name).to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 下载一个分片组的全部分片：已在库的跳过并落日志，其余逐个走预检入队。
+async fn download_shard_group(app: &Arc<App>, group_index: usize) {
+    let (repo, names) = {
+        let core = app.core();
+        let Some(detail) = core.lib.detail.as_ref() else { return };
+        let groups = crate::hf::shard_groups(&detail.files);
+        let Some((_, indexes)) = groups.get(group_index) else {
+            return;
+        };
+        (
+            detail.summary.repo.clone(),
+            indexes.iter().map(|i| detail.files[*i].name.clone()).collect::<Vec<_>>(),
+        )
+    };
+    let (dir, mirror_id) = {
+        let core = app.core();
+        (core.settings.models_dir.clone(), core.settings.download_mirror.clone())
+    };
+    let local = {
+        let core = app.core();
+        local_library_files(&core, &repo)
+    };
+    for name in names {
+        if local.contains(&crate::modelscan::file_name_of(&name).to_lowercase()) {
+            app.log_status(format!("已在库，跳过：{}", crate::modelscan::file_name_of(&name)));
+            continue;
+        }
+        submit_download(
+            app,
+            DownloadRequest { input: format!("{repo}/{name}"), dir: dir.clone(), mirror_id: mirror_id.clone() },
+            false,
+        )
+        .await;
+    }
 }
 
 /// 切换下载镜像站（模型库工具行与设置页共用同一份设置）。
@@ -983,29 +1086,44 @@ async fn open_detail(app: &Arc<App>, index: usize) {
         summary.repo.clone()
     };
     let mirror = crate::mirrors::mirror_by_id(&app.core().settings.download_mirror);
-    let cached = {
-        let core = app.core();
-        // 在途时忽略新点击：两个在途请求各自落地会「后完成者胜」，详情可能停在先点的仓库
-        if core.lib.detail_loading {
-            return;
-        }
-        // 已展示同一仓库（重复点击）不重打接口
+    let generation = {
+        let mut core = app.core();
         if core.lib.detail.as_ref().is_some_and(|detail| detail.summary.repo == repo) {
+            // 已展示同一仓库（重复点击）不重打接口；此时另有仓库在途加载则丢弃在途，保住当前展示
+            if core.lib.detail_loading {
+                core.lib.detail_gen += 1;
+                core.lib.detail_loading = false;
+                drop(core);
+                app.invalidate();
+            }
             return;
         }
-        core.lib.cached_detail(mirror.id, &repo)
+        // 并发点击最后点击胜出：在途的旧请求落地时轮次不符即整批丢弃
+        core.lib.detail_gen += 1;
+        core.lib.detail_loading = true;
+        core.lib.detail_gen
     };
-    if let Some(detail) = cached {
-        app.core().lib.detail = Some(detail);
+    app.invalidate();
+    if let Some(detail) = {
+        let core = app.core();
+        core.lib.cached_detail(mirror.id, &repo)
+    } {
+        let mut core = app.core();
+        if core.lib.detail_gen == generation {
+            core.lib.detail = Some(detail);
+            core.lib.detail_loading = false;
+        }
+        drop(core);
         app.invalidate();
         return;
     }
-    app.core().lib.detail_loading = true;
-    app.invalidate();
     let client = app.client.clone();
     let result = fetch_repo_detail(&client, mirror, &repo).await;
     {
         let mut core = app.core();
+        if core.lib.detail_gen != generation {
+            return; // 已有更新的点击在途或落地，本轮结果作废
+        }
         core.lib.detail_loading = false;
         match result {
             Ok(detail) => {
@@ -1027,39 +1145,16 @@ async fn download_detail_file(app: &Arc<App>, index: usize, rename: bool) {
     };
     let dir = app.core().settings.models_dir.clone();
     let mirror_id = app.core().settings.download_mirror.clone();
-    let request = DownloadRequest {
-        input: format!("{repo}/{file}"),
-        dir,
-        mirror_id,
-    };
-    start_download(app, request, rename).await;
+    submit_download(app, DownloadRequest { input: format!("{repo}/{file}"), dir, mirror_id }, rename).await;
 }
 
-/// 预检并启动下载。重名拒绝时留下请求与可读原因，界面据此提供「改名保留」。
-async fn start_download(app: &Arc<App>, request: DownloadRequest, rename: bool) {
-    app.core().lib.last_download = Some(DownloadRequest {
-        input: request.input.clone(),
-        dir: request.dir.clone(),
-        mirror_id: request.mirror_id.clone(),
-    });
-    app.invalidate();
+/// 提交一次下载（预检在下载器内完成，失败落错误卡）。
+/// 重复提交等不入卡的情形落一行状态日志。
+async fn submit_download(app: &Arc<App>, request: DownloadRequest, rename: bool) {
     let mode = if rename { crate::download::PrepareMode::Rename } else { crate::download::PrepareMode::Skip };
-    match app.downloader.prepare(&request, mode).await {
-        Ok(prepared) => {
-            app.core().lib.dl_conflict = false;
-            app.downloader.start(prepared.task);
-        }
-        Err(err) => {
-            let mut core = app.core();
-            core.dl.status = DownloadStatus::Error;
-            core.dl.status_text = err.error;
-            core.lib.dl_conflict = err.existing_path.is_some();
-            if let Some(existing) = err.existing_path {
-                core.dl.status_text = format!("{}（可点「改名保留」换名下载）", existing);
-            }
-        }
+    if let Err(message) = app.downloader.submit(request, mode).await {
+        app.log_status(message);
     }
-    app.invalidate();
 }
 
 // ---------- 控制台面 ----------
@@ -1143,6 +1238,10 @@ async fn console_event(app: &Arc<App>, node: &str, event: &ViewEvent) {
         "start" => {
             let app = Arc::clone(app);
             tokio::spawn(async move { controller::start(&app).await });
+        }
+        "restart" => {
+            let app = Arc::clone(app);
+            tokio::spawn(async move { controller::restart(&app).await });
         }
         "stop" => {
             let app = Arc::clone(app);
@@ -1251,6 +1350,12 @@ async fn console_event(app: &Arc<App>, node: &str, event: &ViewEvent) {
         "nowebui" => {
             let value = as_bool(&event_value_of(event)).unwrap_or(false);
             update_params(app, |params, _| params.no_webui = value).await;
+        }
+        "apikey" => {
+            if let Some(text) = as_text(&event_value_of(event)) {
+                let text = text.trim().to_string();
+                update_params(app, |params, _| params.api_key = text).await;
+            }
         }
         "extra" => {
             if let Some(text) = as_text(&event_value_of(event)) {

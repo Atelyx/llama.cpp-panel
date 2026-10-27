@@ -31,11 +31,17 @@ pub async fn probe_once(client: &reqwest::Client, settings: &LlamaSettings) -> b
     false
 }
 
-/// 当前模型附加参数里声明的 API 密钥（--api-key 值 或 --api-key=值）；未声明返回 None。
+/// 当前模型声明的 API 密钥：优先取专用的「API 密钥」字段，未填再从附加参数里认
+/// `--api-key 值` 或 `--api-key=值`（旧写法兼容）；都没有返回 None。
 fn api_key_of(settings: &LlamaSettings) -> Option<String> {
     let model_dir = normalize_dir(&settings.model_file);
     let dir = model_dir.rfind('/').map(|idx| &model_dir[..idx]).unwrap_or("");
-    let args = split_args(&params_for(settings, dir).extra_args);
+    let params = params_for(settings, dir);
+    let dedicated = params.api_key.trim();
+    if !dedicated.is_empty() {
+        return Some(dedicated.to_string());
+    }
+    let args = split_args(&params.extra_args);
     let spaced = args
         .iter()
         .position(|arg| arg == "--api-key")
@@ -76,5 +82,23 @@ mod tests {
         );
         assert_eq!(api_key_of(&settings_with_extra("--jinja")), None);
         assert_eq!(api_key_of(&settings_with_extra("--api-key")), None, "缺值不误取旗标");
+    }
+
+    #[test]
+    fn dedicated_api_key_field_wins_over_extra_args() {
+        let mut settings = settings_with_extra("--api-key sk-from-extra");
+        settings
+            .model_params
+            .get_mut("C:/models/q")
+            .unwrap()
+            .api_key = "sk-dedicated".into();
+        assert_eq!(api_key_of(&settings), Some("sk-dedicated".into()));
+        // 专用字段留空时回落到附加参数里的旧写法
+        settings
+            .model_params
+            .get_mut("C:/models/q")
+            .unwrap()
+            .api_key = "  ".into();
+        assert_eq!(api_key_of(&settings), Some("sk-from-extra".into()));
     }
 }

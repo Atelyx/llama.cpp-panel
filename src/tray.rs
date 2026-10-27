@@ -19,6 +19,7 @@ const TICK: Duration = Duration::from_secs(1);
 const ITEM_STATUS: &str = "status";
 const ITEM_START: &str = "start";
 const ITEM_STOP: &str = "stop";
+const ITEM_COPY: &str = "copy";
 
 /// 常驻巡检任务：立即同步一次，之后按拍同步。
 pub fn spawn(app: &Arc<App>) {
@@ -53,7 +54,7 @@ pub async fn sync(app: &Arc<App>) {
     }
 }
 
-/// 托盘点击：与面板按钮同一入口（启动含就绪等待，各自起任务不堵巡检）。
+/// 托盘点击：启停与面板按钮同一入口；复制地址直接写剪贴板。
 pub async fn on_click(app: &Arc<App>, id: &str) {
     match id {
         ITEM_START => {
@@ -64,11 +65,15 @@ pub async fn on_click(app: &Arc<App>, id: &str) {
             let app = Arc::clone(app);
             tokio::spawn(async move { controller::stop(&app).await });
         }
+        ITEM_COPY => {
+            let url = settings::base_url(&app.core().settings);
+            crate::app::copy_text(app, url, "服务地址").await;
+        }
         _ => {}
     }
 }
 
-/// 条目：状态行（置灰只读）+ 与状态互斥的启停项。
+/// 条目：状态行（置灰只读）+ 与状态互斥的启停项 + 复制服务地址。
 fn items(phase: RunPhase, addr: &str) -> Vec<TrayItemSpec> {
     let stopping = matches!(phase, RunPhase::Running | RunPhase::Starting);
     vec![
@@ -82,6 +87,11 @@ fn items(phase: RunPhase, addr: &str) -> Vec<TrayItemSpec> {
             label: if stopping { "停止 llama-server" } else { "启动 llama-server" }.into(),
             enabled: Some(true),
         },
+        TrayItemSpec {
+            id: ITEM_COPY.into(),
+            label: "复制服务地址".into(),
+            enabled: Some(true),
+        },
     ]
 }
 
@@ -92,10 +102,12 @@ mod tests {
     #[test]
     fn tray_items_mirror_phase() {
         let running = items(RunPhase::Running, "http://127.0.0.1:8080");
-        assert_eq!(running.len(), 2);
+        assert_eq!(running.len(), 3);
         assert_eq!(running[0].enabled, Some(false), "状态行置灰只读");
         assert!(running[0].label.contains("运行中"));
         assert_eq!(running[1].id, ITEM_STOP);
+        assert_eq!(running[2].id, ITEM_COPY, "复制服务地址常驻");
+        assert_eq!(running[2].enabled, Some(true));
 
         let stopped = items(RunPhase::Stopped, "http://127.0.0.1:8080");
         assert_eq!(stopped[1].id, ITEM_START);
